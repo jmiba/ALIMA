@@ -1149,6 +1149,11 @@ class AlimaWebapp {
                         is_standard: Object.prototype.hasOwnProperty.call(item, 'is_standard') ? item.is_standard : null,
                         canonical_code: item.canonical_code || item.code || display,
                         label: item.label || null,
+                        source: item.source || null,
+                        ancestor_path: item.ancestor_path || null,
+                        graph_joint_seed_count: item.graph_joint_seed_count ?? null,
+                        graph_parent_distance: item.graph_parent_distance ?? null,
+                        graph_evidence: Array.isArray(item.graph_evidence) ? item.graph_evidence : [],
                         validation_message: item.validation_message || null,
                         validation_source: item.validation_source || null,
                     };
@@ -1165,9 +1170,178 @@ class AlimaWebapp {
             is_standard: null,
             canonical_code: item,
             label: null,
+            source: null,
+            ancestor_path: null,
+            graph_joint_seed_count: null,
+            graph_parent_distance: null,
+            graph_evidence: [],
             validation_message: null,
             validation_source: null,
         }));
+    }
+
+    buildClassificationDetailMap(results) {
+        const detailMap = new Map();
+        const flattened = Array.isArray(results?.dk_search_results_flattened)
+            ? results.dk_search_results_flattened
+            : [];
+
+        const makeKey = (system, code) => `${String(system || '').toUpperCase()}|${String(code || '').trim()}`;
+
+        flattened.forEach(item => {
+            if (!item || typeof item !== 'object') return;
+            const system = String(item.classification_type || item.type || '').toUpperCase();
+            const code = String(item.dk || '').trim();
+            if (!system || !code) return;
+
+            const key = makeKey(system, code);
+            const existing = detailMap.get(key) || {
+                source: null,
+                label: null,
+                ancestor_path: null,
+                validation_status: null,
+                validation_message: null,
+                graph_joint_seed_count: null,
+                graph_parent_distance: null,
+                graph_evidence: [],
+            };
+
+            if (!existing.source && item.source) existing.source = item.source;
+            if (!existing.label && item.label) existing.label = item.label;
+            if (!existing.ancestor_path && item.ancestor_path) existing.ancestor_path = item.ancestor_path;
+            if (!existing.validation_status && item.rvk_validation_status) existing.validation_status = item.rvk_validation_status;
+            if (!existing.validation_message && item.validation_message) existing.validation_message = item.validation_message;
+            if (item.graph_joint_seed_count != null) {
+                existing.graph_joint_seed_count = Math.max(Number(existing.graph_joint_seed_count || 0), Number(item.graph_joint_seed_count || 0));
+            }
+            if (item.graph_parent_distance != null) {
+                const nextDistance = Number(item.graph_parent_distance || 0);
+                if (nextDistance > 0 && (!existing.graph_parent_distance || nextDistance < existing.graph_parent_distance)) {
+                    existing.graph_parent_distance = nextDistance;
+                }
+            }
+
+            const existingEvidenceKeys = new Set(
+                (existing.graph_evidence || []).map(ev => JSON.stringify([
+                    ev?.seed || '',
+                    ev?.seed_type || '',
+                    ev?.match_type || '',
+                    Array.isArray(ev?.path) ? ev.path : [],
+                ]))
+            );
+            (Array.isArray(item.graph_evidence) ? item.graph_evidence : []).forEach(ev => {
+                const key = JSON.stringify([
+                    ev?.seed || '',
+                    ev?.seed_type || '',
+                    ev?.match_type || '',
+                    Array.isArray(ev?.path) ? ev.path : [],
+                ]);
+                if (existingEvidenceKeys.has(key)) return;
+                existing.graph_evidence.push(ev);
+                existingEvidenceKeys.add(key);
+            });
+
+            detailMap.set(key, existing);
+        });
+
+        return detailMap;
+    }
+
+    enrichClassifications(classifications, results) {
+        const detailMap = this.buildClassificationDetailMap(results);
+        const makeKey = (system, code) => `${String(system || '').toUpperCase()}|${String(code || '').trim()}`;
+
+        return classifications.map(cls => {
+            const details = detailMap.get(makeKey(cls.system, cls.code)) || {};
+            return {
+                ...details,
+                ...cls,
+                source: cls.source || details.source || null,
+                label: cls.label || details.label || null,
+                ancestor_path: cls.ancestor_path || details.ancestor_path || null,
+                validation_status: cls.validation_status || details.validation_status || null,
+                validation_message: cls.validation_message || details.validation_message || null,
+                graph_joint_seed_count: cls.graph_joint_seed_count ?? details.graph_joint_seed_count ?? null,
+                graph_parent_distance: cls.graph_parent_distance ?? details.graph_parent_distance ?? null,
+                graph_evidence: Array.isArray(cls.graph_evidence) && cls.graph_evidence.length
+                    ? cls.graph_evidence
+                    : (Array.isArray(details.graph_evidence) ? details.graph_evidence : []),
+            };
+        });
+    }
+
+    getGraphMatchLabel(matchType) {
+        const labels = {
+            direct_concept: 'Direkttreffer',
+            term: 'Begriffstreffer',
+            ancestor: 'Elternknoten',
+            child: 'Unterklasse',
+            sibling: 'Geschwisterknoten',
+            branch: 'Zweigkontext',
+        };
+        return labels[matchType] || matchType || 'Pfad';
+    }
+
+    getSourceLabel(source) {
+        const labels = {
+            rvk_graph: 'RVK-Graph',
+            rvk_gnd_index: 'RVK-GND-Index',
+            rvk_api: 'RVK-API-Label',
+        };
+        if (!source) return '';
+        if (labels[source]) return labels[source];
+        if (String(source).startsWith('catalog')) return 'Katalog';
+        return String(source);
+    }
+
+    buildGraphRationale(cls) {
+        const graphEvidence = Array.isArray(cls.graph_evidence) ? cls.graph_evidence : [];
+        if (!graphEvidence.length) return '';
+
+        const seeds = [];
+        const seenSeeds = new Set();
+        graphEvidence.forEach(item => {
+            const seed = String(item?.seed || '').trim();
+            if (!seed || seenSeeds.has(seed)) return;
+            seenSeeds.add(seed);
+            seeds.push(seed);
+        });
+        const seedText = seeds.slice(0, 2).join(', ') || 'den thematischen Ankern';
+
+        const matchTypes = new Set(
+            graphEvidence
+                .map(item => String(item?.match_type || '').trim())
+                .filter(Boolean)
+        );
+
+        const parts = [];
+        if (matchTypes.has('direct_concept') || matchTypes.has('term')) {
+            parts.push(`direkte thematische Treffer für ${seedText}`);
+        }
+        if (matchTypes.has('ancestor')) parts.push('Stützung über Elternknoten');
+        if (matchTypes.has('child')) parts.push('Erweiterung über spezifischere Unterklassen');
+        if (matchTypes.has('sibling')) parts.push('Ergänzung über Geschwisterknoten im selben Zweig');
+        if (matchTypes.has('branch')) parts.push('Passung über Zweigkontext');
+
+        return parts.length ? `RVK-Graph: ${parts.join('; ')}` : '';
+    }
+
+    buildGraphEvidenceItems(cls, maxItems = 3) {
+        const graphEvidence = Array.isArray(cls.graph_evidence) ? cls.graph_evidence : [];
+        return graphEvidence
+            .slice()
+            .sort((a, b) => Number(b?.weight || 0) - Number(a?.weight || 0))
+            .slice(0, maxItems)
+            .map(item => {
+                const path = Array.isArray(item?.path) ? item.path.filter(Boolean) : [];
+                const pathHtml = path.map(part => this.escapeHtml(part)).join(' &rarr; ');
+                const matchLabel = this.escapeHtml(this.getGraphMatchLabel(item?.match_type));
+                if (pathHtml) {
+                    return `${pathHtml} <span style="color:#666;">(${matchLabel})</span>`;
+                }
+                const seedHtml = this.escapeHtml(item?.seed || '');
+                return `${seedHtml} <span style="color:#666;">(${matchLabel})</span>`;
+            });
     }
 
     getRvkValidationSummary(classifications, backendSummary = null) {
@@ -1195,7 +1369,10 @@ class AlimaWebapp {
 
         const initialKeywords = this.normalizeList(results.initial_keywords);
         const finalKeywords = this.normalizeList(results.final_keywords);
-        const classifications = this.normalizeClassifications(results.classifications, results.dk_classifications);
+        const classifications = this.enrichClassifications(
+            this.normalizeClassifications(results.classifications, results.dk_classifications),
+            results,
+        );
         const rvkSummary = this.getRvkValidationSummary(classifications, results.classification_validation);
 
         // Display original abstract
@@ -1238,6 +1415,12 @@ class AlimaWebapp {
             this.appendStreamText(`\n[${this.getTime()}] DK/RVK Klassifikationen:`);
             classifications.forEach(cls => {
                 this.appendStreamText(`  ${cls.display}`);
+                if (cls.system === 'RVK') {
+                    const rationale = this.buildGraphRationale(cls);
+                    if (rationale) {
+                        this.appendStreamText(`    ↳ ${rationale}`);
+                    }
+                }
             });
 
             if (rvkSummary.nonStandard > 0) {
@@ -1254,6 +1437,7 @@ class AlimaWebapp {
             const provenanceParts = [];
             if (provenance.catalog_standard > 0) provenanceParts.push(`Katalog standard ${provenance.catalog_standard}`);
             if (provenance.catalog_nonstandard > 0) provenanceParts.push(`Katalog lokal ${provenance.catalog_nonstandard}`);
+            if (provenance.rvk_graph > 0) provenanceParts.push(`RVK-Graph ${provenance.rvk_graph}`);
             if (provenance.rvk_gnd_index > 0) provenanceParts.push(`RVK-GND-Index ${provenance.rvk_gnd_index}`);
             if (provenance.rvk_api > 0) provenanceParts.push(`RVK-API-Label ${provenance.rvk_api}`);
             if (provenanceParts.length > 0) {
@@ -1295,7 +1479,10 @@ class AlimaWebapp {
         summaryDiv.innerHTML = '';
 
         const finalKeywords = this.normalizeList(results.final_keywords);
-        const classifications = this.normalizeClassifications(results.classifications, results.dk_classifications);
+        const classifications = this.enrichClassifications(
+            this.normalizeClassifications(results.classifications, results.dk_classifications),
+            results,
+        );
         const initialKeywords = this.normalizeList(results.initial_keywords);
         const rvkSummary = this.getRvkValidationSummary(classifications, results.classification_validation);
 
@@ -1349,9 +1536,17 @@ class AlimaWebapp {
                 if (cls.system === 'RVK' && cls.label) {
                     metaParts.push(this.escapeHtml(cls.label));
                 }
+                if (cls.system === 'RVK' && cls.source) {
+                    metaParts.push(`Quelle: ${this.escapeHtml(this.getSourceLabel(cls.source))}`);
+                }
+                if (cls.system === 'RVK' && cls.ancestor_path) {
+                    metaParts.push(`Zweig: ${this.escapeHtml(cls.ancestor_path)}`);
+                }
                 if (cls.system === 'RVK' && cls.validation_message && cls.validation_status !== 'standard') {
                     metaParts.push(this.escapeHtml(cls.validation_message));
                 }
+                const rationale = cls.system === 'RVK' ? this.buildGraphRationale(cls) : '';
+                const evidenceItems = cls.system === 'RVK' ? this.buildGraphEvidenceItems(cls) : [];
 
                 return `<div class="classification-entry">
                     <div class="classification-entry__head">
@@ -1360,6 +1555,8 @@ class AlimaWebapp {
                         ${validationHtml}
                     </div>
                     ${metaParts.length > 0 ? `<div class="classification-entry__meta">${metaParts.join(' · ')}</div>` : ''}
+                    ${rationale ? `<div class="classification-entry__meta" style="color:#2a5c7a;"><strong>Graph-Rationale:</strong> ${this.escapeHtml(rationale)}</div>` : ''}
+                    ${evidenceItems.length > 0 ? `<ul class="classification-entry__meta" style="margin:6px 0 0 18px; color:#444;">${evidenceItems.map(item => `<li>${item}</li>`).join('')}</ul>` : ''}
                 </div>`;
             }).join('');
 

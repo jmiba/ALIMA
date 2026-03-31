@@ -387,7 +387,17 @@ class PipelineStepExecutor:
 
     def _filter_alima_kwargs(self, kwargs: Dict[str, Any], exclude_llm_params: bool = False) -> Dict[str, Any]:
         """Centralized parameter filtering for AlimaManager calls - Claude Generated"""
-        excluded_params = ["step_id", "keyword_chunking_threshold", "chunking_task", "expand_synonyms", "dk_max_results", "dk_frequency_threshold"]
+        excluded_params = [
+            "step_id",
+            "keyword_chunking_threshold",
+            "chunking_task",
+            "expand_synonyms",
+            "dk_max_results",
+            "dk_frequency_threshold",
+            "use_rvk_graph_retrieval",
+            "original_abstract",
+            "llm_analysis",
+        ]
 
         # Some methods need to exclude LLM parameters that are handled separately
         if exclude_llm_params:
@@ -1957,8 +1967,15 @@ class PipelineStepExecutor:
                 institution_library_rvk_count += 1
                 continue
 
-            if result.get("source") in {"rvk_api", "rvk_gnd_index"}:
-                if result.get("label") or result.get("ancestor_path"):
+            if classification_type == "RVK":
+                has_titles = bool(result.get("titles") and any(t.strip() for t in result.get("titles", [])))
+                has_authority_context = bool(
+                    result.get("label")
+                    or result.get("ancestor_path")
+                    or int(result.get("count", 0) or 0) > 0
+                    or result.get("source") in {"rvk_api", "rvk_gnd_index", "rvk_graph"}
+                )
+                if has_titles or has_authority_context:
                     results_with_titles.append(result)
                 else:
                     titleless_count += 1
@@ -2041,6 +2058,54 @@ class PipelineStepExecutor:
             else:
                 allowed_standard_rvk_map[normalized] = f"RVK {normalized}"
 
+        graph_retrieval_enabled = bool(kwargs.get("use_rvk_graph_retrieval", False)) or any(
+            str(result.get("source", "catalog") or "catalog") == "rvk_graph"
+            for result in results_with_titles
+            if str(result.get("classification_type", result.get("type", "DK"))).upper() == "RVK"
+        )
+
+        if stream_callback and graph_retrieval_enabled:
+            rvk_results_with_titles = [
+                result for result in results_with_titles
+                if str(result.get("classification_type", result.get("type", "DK"))).upper() == "RVK"
+            ]
+            graph_rvk_after_filter = [
+                result for result in rvk_results_with_titles
+                if str(result.get("source", "catalog") or "catalog") == "rvk_graph"
+            ]
+            if graph_rvk_after_filter:
+                stream_callback(
+                    f"ℹ️ RVK-Graph nach Deduplizierung/Vorfilterung: {len(graph_rvk_after_filter)} RVK-Kandidaten\n",
+                    "dk_classification",
+                )
+
+        prompt_candidate_slice = results_with_titles[:60]
+        if stream_callback and graph_retrieval_enabled:
+            prompt_rvk = [
+                result for result in prompt_candidate_slice
+                if str(result.get("classification_type", result.get("type", "DK"))).upper() == "RVK"
+            ]
+            prompt_sources = {
+                "rvk_graph": 0,
+                "rvk_gnd_index": 0,
+                "rvk_api": 0,
+                "catalog": 0,
+            }
+            for result in prompt_rvk:
+                source = str(result.get("source", "catalog") or "catalog")
+                if source not in prompt_sources:
+                    source = "catalog"
+                prompt_sources[source] += 1
+            stream_callback(
+                "ℹ️ RVK im LLM-Prompt: "
+                f"{len(prompt_rvk)} RVK von {len(prompt_candidate_slice)} Gesamteinträgen "
+                f"(Graph {prompt_sources['rvk_graph']}, "
+                f"GND-Index {prompt_sources['rvk_gnd_index']}, "
+                f"API {prompt_sources['rvk_api']}, "
+                f"Katalog {prompt_sources['catalog']})\n",
+                "dk_classification",
+            )
+
         # Format catalog results for LLM prompt with aggregated data - Claude Generated
         catalog_text = PipelineResultFormatter.format_dk_results_for_prompt(results_with_titles)
 
@@ -2083,6 +2148,50 @@ class PipelineStepExecutor:
         # Filter parameters using centralized method - Claude Generated
         alima_kwargs = self._filter_alima_kwargs(kwargs, exclude_llm_params=True)
 
+        candidate_pool = list(results_with_titles)
+        max_total_classifications = 10
+        fallback_rvk: List[str] = []
+        if graph_retrieval_enabled:
+            if stream_callback:
+                stream_callback(
+                    "ℹ️ Überspringe deterministische RVK-Fallback-Shortlist, da RVK-Graph-Retrieval aktiv ist\n",
+                    "dk_classification",
+                )
+        else:
+            fallback_rvk = self._select_final_rvk_candidates(
+                candidate_pool,
+                original_abstract,
+                max_standard=2,
+                max_nonstandard=1,
+                rvk_anchor_keywords=rvk_anchor_keywords,
+                model=model,
+                provider=provider,
+                stream_callback=stream_callback,
+                mode=mode,
+                llm_kwargs=alima_kwargs,
+                score_with_llm=False,
+            )
+        fallback_dk = self._select_final_dk_candidates(
+            candidate_pool,
+            max_results=max(1, max_total_classifications - max(1, len(fallback_rvk))),
+        )
+
+        fallback_final_rvk = self._merge_final_rvk_selections(
+            [],
+            fallback_rvk,
+            minimum_count=1 if fallback_rvk else 0,
+            preferred_count=min(2, len(fallback_rvk)),
+            maximum_count=min(2, max_total_classifications),
+        )
+        fallback_final_dk = self._merge_final_dk_selections(
+            [],
+            fallback_dk,
+            minimum_count=1 if fallback_dk and (max_total_classifications - len(fallback_final_rvk)) > 0 else 0,
+            preferred_count=max(0, max_total_classifications - len(fallback_final_rvk)),
+            maximum_count=max(0, max_total_classifications - len(fallback_final_rvk)),
+        )
+        deterministic_final_classes = list(dict.fromkeys(fallback_final_dk + fallback_final_rvk))
+
         # Execute LLM classification
         try:
             task_state = self.alima_manager.analyze_abstract(
@@ -2095,48 +2204,98 @@ class PipelineStepExecutor:
                 **alima_kwargs,
             )
 
-            if task_state.status == "failed":
-                if stream_callback:
-                    stream_callback(f"LLM-Klassifikation fehlgeschlagen: {task_state.analysis_result.full_text}\n", "dk_classification")
-                return [], None
-
-            # Extract DK classifications from LLM response
             response_text = task_state.analysis_result.full_text
+            llm_failed = task_state.status == "failed"
+            if llm_failed and stream_callback:
+                stream_callback(
+                    f"LLM-Klassifikation fehlgeschlagen: {response_text}\n",
+                    "dk_classification",
+                )
+
             # Pass output_format from prompt_config for JSON extraction - Claude Generated
             _output_format = getattr(task_state.prompt_config, 'output_format', None) if task_state.prompt_config else None
-            llm_classifications = self._extract_dk_from_response(response_text, output_format=_output_format)
-            llm_classifications = self._filter_final_rvk_classifications(
-                llm_classifications,
+            llm_output_classes = [] if llm_failed else self._extract_dk_from_response(response_text, output_format=_output_format)
+            llm_output_classes = list(dict.fromkeys(llm_output_classes))
+            filtered_llm_output_classes = self._filter_final_rvk_classifications(
+                llm_output_classes,
                 allowed_standard_rvk_map,
                 allowed_nonstandard_rvk_map,
                 stream_callback=stream_callback,
             )
             # Extract analysis text from LLM response - Claude Generated
             from ..core.processing_utils import extract_analyse_text_from_response
-            analyse_text = extract_analyse_text_from_response(response_text, output_format=_output_format)
+            analyse_text = (
+                extract_analyse_text_from_response(response_text, output_format=_output_format)
+                if not llm_failed else ""
+            )
 
             llm_dk_only = [
-                code for code in llm_classifications
+                code for code in filtered_llm_output_classes
                 if not str(code or "").strip().upper().startswith("RVK ")
             ]
             llm_rvk_only = [
-                code for code in llm_classifications
+                code for code in filtered_llm_output_classes
                 if str(code or "").strip().upper().startswith("RVK ")
             ]
 
-            rescored_rvk = self._select_final_rvk_with_dk_context(
-                results_with_titles,
-                original_abstract,
-                llm_dk_only,
-                rvk_anchor_keywords=rvk_anchor_keywords,
-                model=model,
-                provider=provider,
-                stream_callback=stream_callback,
-                mode=mode,
-                llm_kwargs=alima_kwargs,
-            )
-            if rescored_rvk:
-                llm_rvk_only = rescored_rvk
+            skip_dk_guided_second_pass = False
+            if graph_retrieval_enabled and filtered_llm_output_classes:
+                skip_dk_guided_second_pass, graph_selected_rvk, skip_reason = self._should_skip_dk_guided_rvk_second_pass(
+                    candidate_pool,
+                    original_abstract,
+                    rvk_anchor_keywords=rvk_anchor_keywords,
+                    stream_callback=stream_callback,
+                )
+                if skip_dk_guided_second_pass:
+                    if stream_callback:
+                        stream_callback(
+                            f"ℹ️ Überspringe DK-basiertes RVK-Zweitranking: {skip_reason}\n",
+                            "dk_classification",
+                        )
+                    if graph_selected_rvk:
+                        llm_rvk_only = graph_selected_rvk
+
+            if not skip_dk_guided_second_pass and filtered_llm_output_classes:
+                rescored_rvk = self._select_final_rvk_with_dk_context(
+                    candidate_pool,
+                    original_abstract,
+                    llm_dk_only,
+                    rvk_anchor_keywords=rvk_anchor_keywords,
+                    model=model,
+                    provider=provider,
+                    stream_callback=stream_callback,
+                    mode=mode,
+                    llm_kwargs=alima_kwargs,
+                )
+                if rescored_rvk:
+                    graph_backed_llm_rvk = []
+                    for code in llm_rvk_only:
+                        normalized = canonicalize_rvk_notation(str(code or "")[4:].strip())
+                        source_info = rvk_source_map.get(normalized, {})
+                        if (
+                            source_info.get("source") == "rvk_graph"
+                            and source_info.get("status", "standard") == "standard"
+                        ):
+                            graph_backed_llm_rvk.append(code)
+
+                    if graph_backed_llm_rvk:
+                        preserved_graph_rvk = self._merge_final_rvk_selections(
+                            graph_backed_llm_rvk,
+                            rescored_rvk,
+                            minimum_count=1,
+                            preferred_count=2,
+                            maximum_count=2,
+                        )
+                        if stream_callback:
+                            stream_callback(
+                                "ℹ️ Erhalte graph-gestützte RVK aus dem ersten LLM-Durchlauf vor DK-Zweitranking:\n"
+                                + "\n".join(f"  {code}" for code in preserved_graph_rvk)
+                                + "\n",
+                                "dk_classification",
+                            )
+                        llm_rvk_only = preserved_graph_rvk
+                    else:
+                        llm_rvk_only = rescored_rvk
 
             pruned_llm_rvk = []
             for code in llm_rvk_only:
@@ -2167,11 +2326,78 @@ class PipelineStepExecutor:
 
             llm_rvk_only = pruned_llm_rvk
 
-            max_total_classifications = 10
-            max_dk_count = max(0, max_total_classifications - len(llm_rvk_only))
-            dk_classifications = list(
-                dict.fromkeys(llm_dk_only[:max_dk_count] + llm_rvk_only)
+            if llm_failed or not llm_output_classes:
+                if stream_callback:
+                    stream_callback(
+                        "LLM lieferte keine finalen Klassen – nutze deterministischen Fallback\n",
+                        "dk_classification",
+                    )
+            elif filtered_llm_output_classes and not (llm_dk_only or llm_rvk_only):
+                if stream_callback:
+                    stream_callback(
+                        "Alle LLM-Klassen wurden verworfen – nutze deterministischen Fallback\n",
+                        "dk_classification",
+                    )
+
+            plausible_dk = bool(llm_dk_only or fallback_dk)
+            plausible_rvk = bool(llm_rvk_only or fallback_rvk)
+            rvk_maximum = min(
+                2,
+                max_total_classifications - 1 if plausible_dk and plausible_rvk and max_total_classifications > 1 else max_total_classifications,
             )
+            final_rvk_only = self._merge_final_rvk_selections(
+                llm_rvk_only,
+                fallback_rvk,
+                minimum_count=1 if fallback_rvk else 0,
+                preferred_count=2,
+                maximum_count=max(0, rvk_maximum),
+            )
+            max_dk_count = max(0, max_total_classifications - len(final_rvk_only))
+            final_dk_only = self._merge_final_dk_selections(
+                llm_dk_only,
+                fallback_dk,
+                minimum_count=1 if fallback_dk and max_dk_count > 0 else 0,
+                preferred_count=max_dk_count,
+                maximum_count=max_dk_count,
+            )
+
+            fallback_added_dk = [code for code in final_dk_only if code not in llm_dk_only]
+            fallback_added_rvk = [code for code in final_rvk_only if code not in llm_rvk_only]
+            if stream_callback and fallback_added_dk:
+                stream_callback(
+                    "Finale DK-Auswahl aus Fallback:\n"
+                    + "\n".join(f"  {code}" for code in fallback_added_dk)
+                    + "\n",
+                    "dk_classification",
+                )
+            if stream_callback and fallback_added_rvk:
+                stream_callback(
+                    "Finale RVK-Auswahl aus Fallback:\n"
+                    + "\n".join(f"  {code}" for code in fallback_added_rvk)
+                    + "\n",
+                    "dk_classification",
+                )
+
+            final_classes = list(
+                dict.fromkeys(final_dk_only + final_rvk_only)
+            )
+            if not final_classes and deterministic_final_classes:
+                if stream_callback:
+                    stream_callback(
+                        "Keine finalen Klassen nach Nachverarbeitung – nutze deterministischen Fallback\n",
+                        "dk_classification",
+                    )
+                final_rvk_only = list(fallback_final_rvk)
+                final_dk_only = list(fallback_final_dk)
+                final_classes = list(deterministic_final_classes)
+
+            if stream_callback and final_rvk_only:
+                stream_callback(
+                    "RVK-Auswahl für finale Ausgabe:\n"
+                    + "\n".join(f"  {code}" for code in final_rvk_only)
+                    + "\n",
+                    "dk_classification",
+                )
 
             # Construct LlmKeywordAnalysis object for history/display - Claude Generated
             from ..core.data_models import LlmKeywordAnalysis
@@ -2184,22 +2410,23 @@ class PipelineStepExecutor:
                 temperature=task_state.prompt_config.temp if task_state.prompt_config else 0.7,
                 seed=task_state.prompt_config.seed if task_state.prompt_config else 0,
                 response_full_text=response_text,
-                extracted_gnd_classes=dk_classifications,
+                extracted_gnd_classes=final_classes,
                 analyse_text=analyse_text  # Analysis text from thought block or JSON - Claude Generated
             )
 
             final_rvk_sources = {
                 "catalog_standard": 0,
                 "catalog_nonstandard": 0,
+                "rvk_graph": 0,
                 "rvk_gnd_index": 0,
                 "rvk_api": 0,
             }
             if stream_callback:
                 stream_callback(
-                    f"DK-Klassifikation abgeschlossen: {len(dk_classifications)} Klassifikationscodes extrahiert\n",
+                    f"DK-Klassifikation abgeschlossen: {len(final_classes)} Klassifikationscodes extrahiert\n",
                     "dk_classification",
                 )
-                for code in dk_classifications:
+                for code in final_classes:
                     clean = str(code or "").strip()
                     if not clean.upper().startswith("RVK "):
                         continue
@@ -2207,7 +2434,9 @@ class PipelineStepExecutor:
                     source_info = rvk_source_map.get(normalized, {})
                     source = source_info.get("source", "catalog")
                     status = source_info.get("status", "standard")
-                    if source == "rvk_gnd_index":
+                    if source == "rvk_graph":
+                        final_rvk_sources["rvk_graph"] += 1
+                    elif source == "rvk_gnd_index":
                         final_rvk_sources["rvk_gnd_index"] += 1
                     elif source == "rvk_api":
                         final_rvk_sources["rvk_api"] += 1
@@ -2221,6 +2450,8 @@ class PipelineStepExecutor:
                     source_parts.append(f"Katalog standard {final_rvk_sources['catalog_standard']}")
                 if final_rvk_sources["catalog_nonstandard"]:
                     source_parts.append(f"Katalog lokal {final_rvk_sources['catalog_nonstandard']}")
+                if final_rvk_sources["rvk_graph"]:
+                    source_parts.append(f"RVK-Graph {final_rvk_sources['rvk_graph']}")
                 if final_rvk_sources["rvk_gnd_index"]:
                     source_parts.append(f"RVK-GND-Index {final_rvk_sources['rvk_gnd_index']}")
                 if final_rvk_sources["rvk_api"]:
@@ -2231,7 +2462,7 @@ class PipelineStepExecutor:
                         "dk_classification",
                     )
             else:
-                for code in dk_classifications:
+                for code in final_classes:
                     clean = str(code or "").strip()
                     if not clean.upper().startswith("RVK "):
                         continue
@@ -2239,7 +2470,9 @@ class PipelineStepExecutor:
                     source_info = rvk_source_map.get(normalized, {})
                     source = source_info.get("source", "catalog")
                     status = source_info.get("status", "standard")
-                    if source == "rvk_gnd_index":
+                    if source == "rvk_graph":
+                        final_rvk_sources["rvk_graph"] += 1
+                    elif source == "rvk_gnd_index":
                         final_rvk_sources["rvk_gnd_index"] += 1
                     elif source == "rvk_api":
                         final_rvk_sources["rvk_api"] += 1
@@ -2252,14 +2485,67 @@ class PipelineStepExecutor:
                 setattr(llm_analysis, "rvk_provenance", final_rvk_sources)
             setattr(task_state, "rvk_provenance", final_rvk_sources)
 
-            return dk_classifications, llm_analysis
+            return final_classes, llm_analysis
 
         except Exception as e:
             if self.logger:
                 self.logger.error(f"LLM DK classification failed: {e}")
             if stream_callback:
                 stream_callback(f"LLM-Klassifikation-Fehler: {str(e)}\n", "dk_classification")
-            return [], None
+                if deterministic_final_classes:
+                    stream_callback(
+                        "LLM lieferte keine finalen Klassen – nutze deterministischen Fallback\n",
+                        "dk_classification",
+                    )
+                    if fallback_final_dk:
+                        stream_callback(
+                            "Finale DK-Auswahl aus Fallback:\n"
+                            + "\n".join(f"  {code}" for code in fallback_final_dk)
+                            + "\n",
+                            "dk_classification",
+                        )
+                    if fallback_final_rvk:
+                        stream_callback(
+                            "Finale RVK-Auswahl aus Fallback:\n"
+                            + "\n".join(f"  {code}" for code in fallback_final_rvk)
+                            + "\n",
+                            "dk_classification",
+                        )
+
+            llm_analysis = None
+            if deterministic_final_classes:
+                from ..core.data_models import LlmKeywordAnalysis
+
+                llm_analysis = LlmKeywordAnalysis(
+                    task_name="dk_classification",
+                    model_used=model or "unknown",
+                    provider_used=provider or "unknown",
+                    prompt_template="",
+                    filled_prompt="",
+                    temperature=float(kwargs.get("temperature", 0.7) or 0.7),
+                    seed=None,
+                    response_full_text=f"Deterministic fallback after dk_classification error: {e}",
+                    extracted_gnd_classes=list(deterministic_final_classes),
+                    analyse_text="",
+                )
+                setattr(
+                    llm_analysis,
+                    "rvk_provenance",
+                    {
+                        "catalog_standard": 0,
+                        "catalog_nonstandard": 0,
+                        "rvk_graph": sum(1 for code in fallback_final_rvk if canonicalize_rvk_notation(str(code or "")[4:].strip()) in {
+                            notation for notation, info in rvk_source_map.items() if str(info.get("source", "")) == "rvk_graph"
+                        }),
+                        "rvk_gnd_index": sum(1 for code in fallback_final_rvk if canonicalize_rvk_notation(str(code or "")[4:].strip()) in {
+                            notation for notation, info in rvk_source_map.items() if str(info.get("source", "")) == "rvk_gnd_index"
+                        }),
+                        "rvk_api": sum(1 for code in fallback_final_rvk if canonicalize_rvk_notation(str(code or "")[4:].strip()) in {
+                            notation for notation, info in rvk_source_map.items() if str(info.get("source", "")) == "rvk_api"
+                        }),
+                    },
+                )
+            return list(deterministic_final_classes), llm_analysis
 
     def _build_rvk_api_fallback_results(
         self,
@@ -2348,6 +2634,168 @@ class PipelineStepExecutor:
             )
 
         return results
+
+    def _build_rvk_graph_results(
+        self,
+        keyword_entries: List[Dict[str, str]],
+        original_abstract: str = "",
+        rvk_anchor_keywords: Optional[List[str]] = None,
+        llm_analysis=None,
+        stream_callback: Optional[callable] = None,
+        max_results_per_keyword: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """Build RVK candidates from the experimental graph-guided retriever."""
+        from .clients.rvk_graph_index import RvkGraphIndex
+
+        index = RvkGraphIndex()
+        if stream_callback:
+            stream_callback("🕸️ Nutze experimentelle RVK-Graph-Retrieval-Pipeline...\n", "dk_search")
+
+        try:
+            results = index.retrieve_candidates(
+                keyword_entries=keyword_entries,
+                original_abstract=original_abstract or "",
+                rvk_anchor_keywords=rvk_anchor_keywords,
+                llm_analysis=llm_analysis,
+                max_results_per_seed=max_results_per_keyword,
+                max_graph_candidates=max(max_results_per_keyword * max(len(keyword_entries or []), 1), 12),
+                progress_callback=(lambda msg: stream_callback(msg, "dk_search")) if stream_callback else None,
+            )
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(f"RVK graph retrieval failed: {exc}")
+            if stream_callback:
+                stream_callback(f"  ⚠️ RVK-Graph-Retrieval fehlgeschlagen: {exc}\n", "dk_search")
+            return []
+
+        if stream_callback and results:
+            total = sum(len(item.get("classifications", [])) for item in results)
+            stream_callback(
+                f"  ✅ RVK-Graph: {total} standardisierte Kandidaten für {len(results)} Keywords\n",
+                "dk_search",
+            )
+
+        return self._enrich_graph_rvk_results_with_catalog_evidence(
+            results,
+            stream_callback=stream_callback,
+        )
+
+    def _enrich_graph_rvk_results_with_catalog_evidence(
+        self,
+        keyword_results: List[Dict[str, Any]],
+        stream_callback: Optional[callable] = None,
+    ) -> List[Dict[str, Any]]:
+        """Attach catalog-derived coverage counts to graph-backed RVK candidates."""
+        if not keyword_results:
+            return keyword_results
+
+        lookup = None
+        try:
+            from .classification_lookup_service import get_classification_lookup_service
+
+            lookup = get_classification_lookup_service()
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(f"RVK graph JSON catalog enrichment unavailable: {exc}")
+
+        ukm = None
+        try:
+            ukm = UnifiedKnowledgeManager()
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(f"RVK graph cache catalog enrichment unavailable: {exc}")
+
+        enriched_count = 0
+        total_rsn_hits = 0
+
+        for keyword_result in keyword_results:
+            classifications = keyword_result.get("classifications", []) or []
+            for classification in classifications:
+                classification_type = str(
+                    classification.get("classification_type", classification.get("type", ""))
+                ).upper()
+                if classification_type != "RVK":
+                    continue
+
+                notation = canonicalize_rvk_notation(classification.get("dk", ""))
+                if not notation:
+                    continue
+
+                unique_rsns = []
+                catalog_hit_count = 0
+                catalog_titles: List[str] = []
+                evidence_source = ""
+                lookup_keys = [f"RVK {notation}", notation]
+                if lookup is not None:
+                    rsns: List[Any] = []
+                    for lookup_key in lookup_keys:
+                        rsns = list(lookup.get_rsns_for_classification(lookup_key) or [])
+                        if rsns:
+                            break
+
+                    seen_rsns = set()
+                    for rsn in rsns:
+                        rsn_key = str(rsn)
+                        if rsn_key in seen_rsns:
+                            continue
+                        seen_rsns.add(rsn_key)
+                        unique_rsns.append(rsn)
+
+                    if unique_rsns:
+                        catalog_hit_count = len(unique_rsns)
+                        try:
+                            title_entries = lookup.get_titles_for_classification(lookup_keys[0]) or []
+                            raw_titles = [
+                                str(item.get("title", "") or "").strip()
+                                for item in title_entries
+                                if isinstance(item, dict)
+                            ]
+                            catalog_titles = PipelineResultFormatter._filter_placeholder_titles(raw_titles)
+                        except Exception:
+                            catalog_titles = []
+                        evidence_source = "classification_lookup"
+
+                if not unique_rsns and ukm is not None:
+                    cached_entries = []
+                    cached_count = 0
+                    for lookup_key in lookup_keys:
+                        cached_entries, cached_count = ukm.get_catalog_titles_for_classification(
+                            lookup_key,
+                            max_titles=5,
+                        )
+                        if cached_count:
+                            break
+
+                    if cached_count:
+                        unique_rsns = [
+                            entry.get("rsn") or f"cached:{idx}"
+                            for idx, entry in enumerate(cached_entries or [], start=1)
+                        ]
+                        catalog_hit_count = int(cached_count)
+                        raw_titles = [
+                            str(entry.get("title", "") or "").strip()
+                            for entry in cached_entries or []
+                            if isinstance(entry, dict)
+                        ]
+                        catalog_titles = PipelineResultFormatter._filter_placeholder_titles(raw_titles)
+                        evidence_source = "catalog_cache"
+
+                classification["catalog_hit_count"] = catalog_hit_count or len(unique_rsns)
+                classification["catalog_evidence_source"] = evidence_source or "classification_lookup"
+                if catalog_titles:
+                    classification["catalog_titles"] = catalog_titles[:5]
+
+                if unique_rsns:
+                    enriched_count += 1
+                    total_rsn_hits += len(unique_rsns)
+
+        if stream_callback and enriched_count:
+            stream_callback(
+                f"  ℹ️ RVK-Graph mit Katalogabdeckung angereichert: {enriched_count} Klassen, {total_rsn_hits} RSN-Treffer\n",
+                "dk_search",
+            )
+
+        return keyword_results
 
     def _validate_catalog_rvk_candidates(
         self,
@@ -2721,6 +3169,10 @@ class PipelineStepExecutor:
         final_search_keywords: List[str],
         dk_search_results: List[Dict[str, Any]],
         gnd_keyword_entries: Optional[List[Dict[str, str]]] = None,
+        use_rvk_graph_retrieval: bool = False,
+        original_abstract: str = "",
+        rvk_anchor_keywords: Optional[List[str]] = None,
+        llm_analysis=None,
         stream_callback: Optional[callable] = None,
     ) -> List[Dict[str, Any]]:
         """Add authority-backed RVK candidates if no standard RVK survived validation."""
@@ -2755,21 +3207,31 @@ class PipelineStepExecutor:
             gnd_entries_for_fallback = list(gnd_keyword_entries or [])
             if use_gnd_index and stream_callback:
                 stream_callback(
-                    "⚠️ Katalog lieferte keine standardisierten RVK-Kandidaten - versuche RVK-GND-Index\n",
+                    "⚠️ Katalog lieferte keine standardisierten RVK-Kandidaten - versuche authority-backed RVK-Fallback\n",
                     "dk_search"
                 )
             if use_gnd_index:
-                rvk_index_results = self._build_rvk_gnd_index_results(
-                    gnd_entries_for_fallback,
-                    stream_callback=stream_callback,
+                rvk_fallback_results = (
+                    self._build_rvk_graph_results(
+                        gnd_entries_for_fallback,
+                        original_abstract=original_abstract,
+                        rvk_anchor_keywords=rvk_anchor_keywords,
+                        llm_analysis=llm_analysis,
+                        stream_callback=stream_callback,
+                    )
+                    if use_rvk_graph_retrieval
+                    else self._build_rvk_gnd_index_results(
+                        gnd_entries_for_fallback,
+                        stream_callback=stream_callback,
+                    )
                 )
-                if rvk_index_results:
+                if rvk_fallback_results:
                     if self.logger:
                         self.logger.info(
-                            f"RVK GND index added {sum(len(item.get('classifications', [])) for item in rvk_index_results)} "
-                            f"candidates across {len(rvk_index_results)} keywords"
+                            f"RVK authority fallback added {sum(len(item.get('classifications', [])) for item in rvk_fallback_results)} "
+                            f"candidates across {len(rvk_fallback_results)} keywords"
                         )
-                    dk_search_results = dk_search_results + rvk_index_results
+                    dk_search_results = dk_search_results + rvk_fallback_results
                     return dk_search_results
 
         if existing_standard_rvk and uncovered_fallback_keywords and stream_callback:
@@ -2782,7 +3244,7 @@ class PipelineStepExecutor:
             )
         elif stream_callback:
             stream_callback(
-                "⚠️ RVK-GND-Index lieferte nichts - nutze offiziellen RVK-API-Label-Fallback\n",
+                "⚠️ Authority-backed RVK-Fallback lieferte nichts - nutze offiziellen RVK-API-Label-Fallback\n",
                 "dk_search"
             )
 
@@ -2860,6 +3322,7 @@ class PipelineStepExecutor:
             "catalog_standard": set(),
             "catalog_nonstandard": set(),
             "catalog_validation_error": set(),
+            "rvk_graph": set(),
             "gnd_index": set(),
             "rvk_api": set(),
         }
@@ -2874,7 +3337,9 @@ class PipelineStepExecutor:
                     continue
                 source = classification.get("source", "")
                 status = classification.get("rvk_validation_status")
-                if source == "rvk_gnd_index":
+                if source == "rvk_graph":
+                    buckets["rvk_graph"].add(normalized)
+                elif source == "rvk_gnd_index":
                     buckets["gnd_index"].add(normalized)
                 elif source == "rvk_api":
                     buckets["rvk_api"].add(normalized)
@@ -2892,6 +3357,8 @@ class PipelineStepExecutor:
             parts.append(f"Katalog lokal {len(buckets['catalog_nonstandard'])}")
         if buckets["catalog_validation_error"]:
             parts.append(f"Katalog ungeprüft {len(buckets['catalog_validation_error'])}")
+        if buckets["rvk_graph"]:
+            parts.append(f"RVK-Graph {len(buckets['rvk_graph'])}")
         if buckets["gnd_index"]:
             parts.append(f"RVK-GND-Index {len(buckets['gnd_index'])}")
         if buckets["rvk_api"]:
@@ -3455,6 +3922,7 @@ class PipelineStepExecutor:
         abstract_text = str(original_abstract or "").lower()
 
         source_weight = {
+            "rvk_graph": 140,
             "rvk_gnd_index": 120,
             "rvk_api": 100,
             "catalog": 80,
@@ -3498,6 +3966,249 @@ class PipelineStepExecutor:
             + anchor_match_bonus
             - broadness_penalty
         )
+
+    def _should_skip_dk_guided_rvk_second_pass(
+        self,
+        candidate_results: List[Dict[str, Any]],
+        original_abstract: str,
+        rvk_anchor_keywords: Optional[List[str]] = None,
+        stream_callback: Optional[callable] = None,
+    ) -> tuple[bool, List[str], str]:
+        """Skip the DK-guided RVK second pass when graph-backed RVK evidence is already strong."""
+        shortlist = self._build_rvk_scoring_shortlist(
+            candidate_results,
+            original_abstract,
+            rvk_anchor_keywords=rvk_anchor_keywords,
+        )
+        if not shortlist:
+            return False, [], ""
+
+        graph_candidates = [
+            candidate
+            for candidate in shortlist
+            if str(candidate.get("source", "catalog") or "catalog") == "rvk_graph"
+            and str(candidate.get("rvk_validation_status", "standard") or "standard") == "standard"
+        ]
+        if not graph_candidates:
+            return False, [], ""
+
+        def _sort_key(item: Dict[str, Any]):
+            return (
+                -int(item.get("_anchor_hit_count", 0)),
+                -int(item.get("_source_rank", 0)),
+                -int(item.get("_status_rank", 0)),
+                -int(item.get("_score", 0)),
+                item.get("dk", ""),
+            )
+
+        graph_candidates.sort(key=_sort_key)
+        shortlist.sort(key=_sort_key)
+
+        top_candidate = graph_candidates[0]
+        top_code = str(top_candidate.get("dk", "") or "").strip()
+        runner_up = next(
+            (
+                candidate
+                for candidate in shortlist
+                if str(candidate.get("dk", "") or "").strip() != top_code
+            ),
+            None,
+        )
+
+        top_score = int(top_candidate.get("_score", 0) or 0)
+        runner_score = int(runner_up.get("_score", 0) or 0) if runner_up else 0
+        score_margin = top_score - runner_score
+        joint_seed_count = int(top_candidate.get("graph_joint_seed_count", 0) or 0)
+        anchor_hit_count = int(top_candidate.get("_anchor_hit_count", 0) or 0)
+        graph_evidence = list(top_candidate.get("graph_evidence", []) or [])
+        direct_graph_support = any(
+            str(item.get("match_type", "") or "") in {"direct_concept", "term"}
+            for item in graph_evidence
+            if isinstance(item, dict)
+        )
+
+        high_confidence = bool(
+            direct_graph_support
+            and (
+                joint_seed_count >= 2
+                or anchor_hit_count >= 2
+                or score_margin >= 40
+            )
+        )
+        if not high_confidence:
+            return False, [], ""
+
+        selected: List[str] = []
+        selected_branches = set()
+        for candidate in graph_candidates:
+            branch = str(candidate.get("branch_family", "") or "")
+            if branch and branch in selected_branches and len(selected) >= 1:
+                continue
+            selected.append(f"RVK {candidate['dk']}")
+            if branch:
+                selected_branches.add(branch)
+            if len(selected) >= 2:
+                break
+
+        if not selected and top_code:
+            selected = [f"RVK {top_code}"]
+        reason = (
+            f"graph-backed RVK confidence high (RVK {top_code}, "
+            f"Seeds={joint_seed_count}, Anchor-Treffer={anchor_hit_count}, Vorsprung={score_margin})"
+        )
+        return True, selected, reason
+
+    @staticmethod
+    def _merge_final_classification_selections(
+        primary_codes: List[str],
+        fallback_codes: List[str],
+        minimum_count: int = 0,
+        preferred_count: int = 0,
+        maximum_count: Optional[int] = None,
+    ) -> List[str]:
+        merged: List[str] = []
+        max_count = int(maximum_count) if maximum_count is not None else None
+
+        for code in list(primary_codes or []):
+            clean = str(code or "").strip()
+            if clean and clean not in merged:
+                merged.append(clean)
+                if max_count is not None and len(merged) >= max_count:
+                    return merged
+
+        fallback_clean = []
+        for code in list(fallback_codes or []):
+            clean = str(code or "").strip()
+            if clean and clean not in fallback_clean:
+                fallback_clean.append(clean)
+
+        if not fallback_clean:
+            return merged[:max_count] if max_count is not None else merged
+
+        target_count = max(
+            int(minimum_count or 0),
+            int(preferred_count or 0),
+        )
+        for code in fallback_clean:
+            if code not in merged:
+                merged.append(code)
+            if max_count is not None and len(merged) >= max_count:
+                break
+            if target_count and len(merged) >= target_count:
+                break
+
+        return merged
+
+    @classmethod
+    def _merge_final_rvk_selections(
+        cls,
+        primary_rvk: List[str],
+        fallback_rvk: List[str],
+        minimum_count: int = 1,
+        preferred_count: int = 2,
+        maximum_count: int = 2,
+    ) -> List[str]:
+        return cls._merge_final_classification_selections(
+            primary_codes=primary_rvk,
+            fallback_codes=fallback_rvk,
+            minimum_count=minimum_count,
+            preferred_count=preferred_count,
+            maximum_count=maximum_count,
+        )
+
+    @classmethod
+    def _merge_final_dk_selections(
+        cls,
+        primary_dk: List[str],
+        fallback_dk: List[str],
+        minimum_count: int = 0,
+        preferred_count: int = 0,
+        maximum_count: Optional[int] = None,
+    ) -> List[str]:
+        return cls._merge_final_classification_selections(
+            primary_codes=primary_dk,
+            fallback_codes=fallback_dk,
+            minimum_count=minimum_count,
+            preferred_count=preferred_count,
+            maximum_count=maximum_count,
+        )
+
+    def _score_dk_candidate(self, candidate: Dict[str, Any]) -> int:
+        """Deterministically score DK candidates for fallback selection."""
+        count = int(candidate.get("count", 0) or 0)
+        matched_keywords = [
+            canonicalize_keyword(keyword).lower()
+            for keyword in (candidate.get("matched_keywords") or [])
+            if canonicalize_keyword(keyword)
+        ]
+        titles = [str(item).strip() for item in (candidate.get("titles") or []) if str(item).strip()]
+        register_entries = [str(item).strip() for item in (candidate.get("register") or []) if str(item).strip()]
+        code = str(candidate.get("dk", "") or "").strip()
+        specificity = len(re.sub(r"[^0-9]", "", code))
+
+        return (
+            min(count, 120) * 5
+            + len(set(matched_keywords)) * 18
+            + min(len(titles), 6) * 5
+            + min(len(register_entries), 6) * 3
+            + specificity * 4
+        )
+
+    def _select_final_dk_candidates(
+        self,
+        candidate_results: List[Dict[str, Any]],
+        max_results: int = 8,
+    ) -> List[str]:
+        """Select final DK deterministically from validated candidates."""
+        aggregated_candidates: Dict[str, Dict[str, Any]] = {}
+
+        for candidate in candidate_results:
+            cls_type = str(candidate.get("classification_type", candidate.get("type", "DK"))).upper()
+            if cls_type != "DK":
+                continue
+
+            code = str(candidate.get("dk", "") or "").strip()
+            if not code:
+                continue
+
+            current = aggregated_candidates.get(code)
+            if current is None:
+                current = dict(candidate)
+                current["dk"] = code
+                current["matched_keywords"] = list(candidate.get("matched_keywords", []) or [])
+                current["titles"] = list(candidate.get("titles", []) or [])
+                current["register"] = list(candidate.get("register", []) or [])
+                current["count"] = int(candidate.get("count", 0) or 0)
+                aggregated_candidates[code] = current
+                continue
+
+            current["count"] = int(current.get("count", 0) or 0) + int(candidate.get("count", 0) or 0)
+            for field in ("matched_keywords", "titles", "register"):
+                existing_values = list(current.get(field, []) or [])
+                seen_values = set(existing_values)
+                for value in candidate.get(field, []) or []:
+                    clean_value = str(value or "").strip()
+                    if clean_value and clean_value not in seen_values:
+                        existing_values.append(clean_value)
+                        seen_values.add(clean_value)
+                current[field] = existing_values
+
+        ranked_candidates = list(aggregated_candidates.values())
+        for candidate in ranked_candidates:
+            candidate["_score"] = self._score_dk_candidate(candidate)
+
+        ranked_candidates.sort(
+            key=lambda item: (
+                -int(item.get("_score", 0)),
+                -int(item.get("count", 0) or 0),
+                item.get("dk", ""),
+            )
+        )
+
+        selected: List[str] = []
+        for candidate in ranked_candidates[: max(0, int(max_results or 0))]:
+            selected.append(f"DK {candidate['dk']}")
+        return selected
 
     def _score_rvk_shortlist_with_llm(
         self,
@@ -3676,6 +4387,7 @@ class PipelineStepExecutor:
 
         def _source_rank(source: str) -> int:
             return {
+                "rvk_graph": 4,
                 "rvk_gnd_index": 3,
                 "rvk_api": 2,
                 "catalog": 1,
@@ -3957,6 +4669,7 @@ class PipelineStepExecutor:
         stream_callback: Optional[callable] = None,
         mode=None,
         llm_kwargs: Optional[Dict[str, Any]] = None,
+        score_with_llm: bool = True,
     ) -> List[str]:
         """Select final RVK deterministically from validated candidates."""
         standard_candidates = []
@@ -3965,6 +4678,7 @@ class PipelineStepExecutor:
 
         def _source_rank(source: str) -> int:
             return {
+                "rvk_graph": 4,
                 "rvk_gnd_index": 3,
                 "rvk_api": 2,
                 "catalog": 1,
@@ -4073,15 +4787,17 @@ class PipelineStepExecutor:
                 if anchored:
                     candidates = anchored
             shortlist = candidates[:8]
-            llm_scores = self._score_rvk_shortlist_with_llm(
-                shortlist,
-                original_abstract,
-                model=model,
-                provider=provider,
-                stream_callback=stream_callback,
-                mode=mode,
-                llm_kwargs=llm_kwargs,
-            )
+            llm_scores = {}
+            if score_with_llm:
+                llm_scores = self._score_rvk_shortlist_with_llm(
+                    shortlist,
+                    original_abstract,
+                    model=model,
+                    provider=provider,
+                    stream_callback=stream_callback,
+                    mode=mode,
+                    llm_kwargs=llm_kwargs,
+                )
             for candidate in shortlist:
                 llm_score = llm_scores.get(candidate["dk"], {})
                 candidate["_llm_total_score"] = int(llm_score.get("total_score", 0) or 0)
@@ -4142,13 +4858,13 @@ class PipelineStepExecutor:
             if shortlisted_standard:
                 preview = ", ".join(f"RVK {item['dk']}" for item in shortlisted_standard[:5])
                 stream_callback(
-                    f"ℹ️ RVK-Shortlist (standard): {preview}\n",
+                    f"\nℹ️ RVK-Fallback-Shortlist (standard): {preview}\n",
                     "dk_classification",
                 )
             elif shortlisted_nonstandard:
                 preview = ", ".join(f"RVK {item['dk']}" for item in shortlisted_nonstandard[:5])
                 stream_callback(
-                    f"ℹ️ RVK-Shortlist (lokal): {preview}\n",
+                    f"\nℹ️ RVK-FallbackShortlist (lokal): {preview}\n",
                     "dk_classification",
                 )
 
@@ -4305,6 +5021,12 @@ class PipelineStepExecutor:
                         "branch_family": cls.get("branch_family"),
                         "rvk_validation_status": cls.get("rvk_validation_status"),
                         "validation_message": cls.get("validation_message"),
+                        "graph_depth": cls.get("graph_depth"),
+                        "graph_joint_seed_count": cls.get("graph_joint_seed_count"),
+                        "graph_parent_distance": cls.get("graph_parent_distance"),
+                        "graph_evidence": list(cls.get("graph_evidence", [])) if cls.get("graph_evidence") else [],
+                        "catalog_hit_count": int(cls.get("catalog_hit_count", 0) or 0),
+                        "catalog_titles": list(cls.get("catalog_titles", [])) if cls.get("catalog_titles") else [],
                     }
 
                 # Merge titles (deduplicate using set) - Claude Generated
@@ -4335,6 +5057,59 @@ class PipelineStepExecutor:
                     grouped[key]["rvk_validation_status"] = cls.get("rvk_validation_status")
                 if cls.get("validation_message") and not grouped[key].get("validation_message"):
                     grouped[key]["validation_message"] = cls.get("validation_message")
+                if cls.get("graph_depth") is not None:
+                    grouped[key]["graph_depth"] = max(
+                        int(grouped[key].get("graph_depth") or 0),
+                        int(cls.get("graph_depth") or 0),
+                    )
+                if cls.get("graph_joint_seed_count") is not None:
+                    grouped[key]["graph_joint_seed_count"] = max(
+                        int(grouped[key].get("graph_joint_seed_count") or 0),
+                        int(cls.get("graph_joint_seed_count") or 0),
+                    )
+                if cls.get("graph_parent_distance") is not None and grouped[key].get("graph_parent_distance") is None:
+                    grouped[key]["graph_parent_distance"] = cls.get("graph_parent_distance")
+                if cls.get("graph_evidence"):
+                    existing_graph_evidence = list(grouped[key].get("graph_evidence", []) or [])
+                    seen_graph_evidence = {
+                        (
+                            item.get("seed"),
+                            item.get("seed_type"),
+                            item.get("match_type"),
+                            tuple(item.get("path", []) or []),
+                        )
+                        for item in existing_graph_evidence
+                        if isinstance(item, dict)
+                    }
+                    for item in cls.get("graph_evidence", []) or []:
+                        if not isinstance(item, dict):
+                            continue
+                        evidence_key = (
+                            item.get("seed"),
+                            item.get("seed_type"),
+                            item.get("match_type"),
+                            tuple(item.get("path", []) or []),
+                        )
+                        if evidence_key in seen_graph_evidence:
+                            continue
+                        existing_graph_evidence.append(item)
+                        seen_graph_evidence.add(evidence_key)
+                    grouped[key]["graph_evidence"] = existing_graph_evidence
+                if cls.get("catalog_hit_count") is not None:
+                    grouped[key]["catalog_hit_count"] = max(
+                        int(grouped[key].get("catalog_hit_count", 0) or 0),
+                        int(cls.get("catalog_hit_count", 0) or 0),
+                    )
+                if cls.get("catalog_titles"):
+                    existing_catalog_titles = list(grouped[key].get("catalog_titles", []) or [])
+                    seen_catalog_titles = set(existing_catalog_titles)
+                    for item in cls.get("catalog_titles", []) or []:
+                        clean_item = str(item or "").strip()
+                        if not clean_item or clean_item in seen_catalog_titles:
+                            continue
+                        existing_catalog_titles.append(clean_item)
+                        seen_catalog_titles.add(clean_item)
+                    grouped[key]["catalog_titles"] = existing_catalog_titles[:10]
 
         # Convert to list and sort by count (most frequent first)
         flattened = sorted(grouped.values(), key=lambda x: x["count"], reverse=True)
@@ -4369,8 +5144,26 @@ class PipelineStepExecutor:
         original_count = sum(len(kr.get("classifications", [])) for kr in keyword_results)
         duplicates_removed = original_count - total_classifications
 
-        # Get top 10 most frequent classifications
-        top_10 = sorted(deduplicated_results, key=lambda x: x["count"], reverse=True)[:10]
+        def _format_stats_entry(result: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "dk": result["dk"],
+                "type": result.get("type", result.get("classification_type", "DK")),
+                "count": result["count"],
+                "keywords": result.get("matched_keywords", []),
+                "unique_titles": len(result.get("titles", []))
+            }
+
+        # Get top classifications overall and by type
+        sorted_results = sorted(deduplicated_results, key=lambda x: x["count"], reverse=True)
+        top_10 = sorted_results[:10]
+        top_dk = [
+            result for result in sorted_results
+            if str(result.get("type", result.get("classification_type", "DK"))).upper() == "DK"
+        ][:10]
+        top_rvk = [
+            result for result in sorted_results
+            if str(result.get("type", result.get("classification_type", "DK"))).upper() == "RVK"
+        ][:10]
 
         # Build keyword coverage map (which keywords led to which DK codes)
         keyword_coverage = {}
@@ -4386,22 +5179,28 @@ class PipelineStepExecutor:
             count = result["count"]
             freq_dist[count] = freq_dist.get(count, 0) + 1
 
+        type_breakdown: Dict[str, Dict[str, int]] = {}
+        for result in deduplicated_results:
+            classification_type = str(
+                result.get("type", result.get("classification_type", "DK"))
+            ).upper()
+            bucket = type_breakdown.setdefault(
+                classification_type,
+                {"classifications": 0, "occurrences": 0},
+            )
+            bucket["classifications"] += 1
+            bucket["occurrences"] += int(result.get("count", 0) or 0)
+
         # Estimated token savings (rough estimate: ~70 tokens per duplicate entry removed)
         estimated_token_savings = duplicates_removed * 70
 
         return {
             "total_classifications": total_classifications,
             "total_keywords_searched": len(keyword_results),
-            "most_frequent": [
-                {
-                    "dk": r["dk"],
-                    "type": r.get("type", r.get("classification_type", "DK")),
-                    "count": r["count"],
-                    "keywords": r.get("matched_keywords", []),
-                    "unique_titles": len(r.get("titles", []))
-                }
-                for r in top_10
-            ],
+            "most_frequent": [_format_stats_entry(r) for r in top_10],
+            "most_frequent_dk": [_format_stats_entry(r) for r in top_dk],
+            "most_frequent_rvk": [_format_stats_entry(r) for r in top_rvk],
+            "type_breakdown": type_breakdown,
             "keyword_coverage": keyword_coverage,
             "frequency_distribution": freq_dist,
             "deduplication_stats": {
@@ -4425,6 +5224,9 @@ class PipelineStepExecutor:
         force_update: bool = False,  # Claude Generated
         strict_gnd_validation: bool = True,  # EXPERT OPTION: Allow disabling strict GND validation
         rvk_anchor_keywords: Optional[List[str]] = None,
+        use_rvk_graph_retrieval: bool = False,
+        original_abstract: str = "",
+        llm_analysis=None,
     ) -> List[Dict[str, Any]]:
         """
         Execute catalog search for DK classification data - Claude Generated
@@ -4446,6 +5248,13 @@ class PipelineStepExecutor:
         # Log force_update status - Claude Generated
         if force_update and self.logger:
             self.logger.info("⚠️ Force update enabled: new titles will be merged with existing")
+
+        if use_rvk_graph_retrieval:
+            graph_msg = "ℹ️ RVK-Graph-Retrieval aktiviert. Graph-basierte authority-backed Kandidaten werden bevorzugt ergänzt.\n"
+            if self.logger:
+                self.logger.info("RVK graph retrieval flag enabled for dk_search")
+            if stream_callback:
+                stream_callback(graph_msg, "dk_search")
 
         # Use provided catalog configuration or allow web fallback - Claude Generated
         if not catalog_token or not catalog_token.strip():
@@ -4828,10 +5637,24 @@ class PipelineStepExecutor:
                 stream_callback=stream_callback,
                 rvk_anchor_keywords=rvk_anchor_keywords,
             )
+            if use_rvk_graph_retrieval and rvk_anchor_entries:
+                graph_results = self._build_rvk_graph_results(
+                    rvk_anchor_entries,
+                    original_abstract=original_abstract,
+                    rvk_anchor_keywords=rvk_anchor_keywords,
+                    llm_analysis=llm_analysis,
+                    stream_callback=stream_callback,
+                )
+                if graph_results:
+                    dk_search_results = dk_search_results + graph_results
             dk_search_results = self._inject_rvk_api_fallback(
                 rvk_anchor_search_keywords or final_search_keywords,
                 dk_search_results,
                 gnd_keyword_entries=rvk_anchor_entries,
+                use_rvk_graph_retrieval=use_rvk_graph_retrieval,
+                original_abstract=original_abstract,
+                rvk_anchor_keywords=rvk_anchor_keywords,
+                llm_analysis=llm_analysis,
                 stream_callback=stream_callback,
             )
             self._emit_rvk_source_diagnostics(
@@ -4873,10 +5696,24 @@ class PipelineStepExecutor:
                     stream_callback=stream_callback,
                     rvk_anchor_keywords=rvk_anchor_keywords,
                 )
+                if use_rvk_graph_retrieval and rvk_anchor_entries:
+                    graph_results = self._build_rvk_graph_results(
+                        rvk_anchor_entries,
+                        original_abstract=original_abstract,
+                        rvk_anchor_keywords=rvk_anchor_keywords,
+                        llm_analysis=llm_analysis,
+                        stream_callback=stream_callback,
+                    )
+                    if graph_results:
+                        dk_search_results = dk_search_results + graph_results
                 dk_search_results = self._inject_rvk_api_fallback(
                     final_search_keywords,
                     dk_search_results,
                     gnd_keyword_entries=gnd_keyword_entries,
+                    use_rvk_graph_retrieval=use_rvk_graph_retrieval,
+                    original_abstract=original_abstract,
+                    rvk_anchor_keywords=rvk_anchor_keywords,
+                    llm_analysis=llm_analysis,
                     stream_callback=stream_callback,
                 )
                 self._emit_rvk_source_diagnostics(
@@ -4995,6 +5832,7 @@ class PipelineStepExecutor:
 
         # ── Step 4: DK classification (optional) ─────────────────────────────
         dk_cfg = _step("dk_classification")
+        dk_search_cfg = _step("dk_search")
         if dk_cfg and getattr(dk_cfg, "enabled", False):
             if stream_callback:
                 stream_callback(f"\n▶ [dk_classification]\n", "dk_classification")
@@ -5011,6 +5849,11 @@ class PipelineStepExecutor:
                     keywords=final_keywords,
                     rvk_anchor_keywords=rvk_anchor_keywords,
                     stream_callback=_cb("dk_classification"),
+                    original_abstract=input_text,
+                    llm_analysis=kw_analysis,
+                    use_rvk_graph_retrieval=bool(
+                        getattr(dk_search_cfg, "custom_params", {}).get("use_rvk_graph_retrieval", False)
+                    ) if dk_search_cfg else False,
                 )
                 state.dk_search_results = dk_search.get("keyword_results", [])
                 state.dk_search_results_flattened = dk_search.get("classifications", [])
@@ -5787,6 +6630,62 @@ class PipelineResultFormatter:
         return filtered
 
     @staticmethod
+    def _format_graph_evidence_for_prompt(
+        graph_evidence: List[Dict[str, Any]],
+        max_items: int = 3,
+    ) -> List[str]:
+        """Render compact graph evidence lines for RVK prompt context."""
+        if not graph_evidence:
+            return []
+
+        match_type_labels = {
+            "direct_concept": "direkter GND-Treffer",
+            "term": "direkter Term-Treffer",
+            "ancestor": "ueber Elternknoten",
+            "child": "ueber Kindknoten",
+            "sibling": "ueber Geschwisterknoten",
+            "branch": "ueber Zweigkontext",
+        }
+
+        evidence_lines: List[str] = []
+        seen_lines = set()
+        sorted_items = sorted(
+            (item for item in graph_evidence if isinstance(item, dict)),
+            key=lambda item: -float(item.get("weight", 0.0) or 0.0),
+        )
+
+        for item in sorted_items:
+            seed = repair_display_text(str(item.get("seed", "") or "").strip())
+            match_type = str(item.get("match_type", "") or "").strip()
+            path_items = [
+                repaired
+                for repaired in (
+                    repair_display_text(str(path_part or "").strip())
+                    for path_part in (item.get("path", []) or [])
+                )
+                if repaired
+            ]
+            compact_path: List[str] = []
+            for path_item in path_items:
+                if not compact_path or compact_path[-1] != path_item:
+                    compact_path.append(path_item)
+
+            detail = match_type_labels.get(match_type, match_type or "Graph-Treffer")
+            if compact_path:
+                line = f"{seed}: {detail} ({' -> '.join(compact_path[:5])})" if seed else f"{detail} ({' -> '.join(compact_path[:5])})"
+            else:
+                line = f"{seed}: {detail}" if seed else detail
+
+            if line in seen_lines:
+                continue
+            seen_lines.add(line)
+            evidence_lines.append(line)
+            if len(evidence_lines) >= max_items:
+                break
+
+        return evidence_lines
+
+    @staticmethod
     def format_dk_results_for_prompt(dk_results: List[Dict[str, Any]], max_results: int = 60) -> str:
         """Format DK/RVK results for LLM prompt or UI display - Claude Generated
         max_results caps total entries to prevent context-length overflow."""
@@ -5825,6 +6724,11 @@ class PipelineResultFormatter:
                 register = result.get("register", [])
                 rvk_validation_status = result.get("rvk_validation_status", "")
                 validation_message = result.get("validation_message", "")
+                graph_joint_seed_count = int(result.get("graph_joint_seed_count", 0) or 0)
+                graph_parent_distance = result.get("graph_parent_distance")
+                graph_evidence = list(result.get("graph_evidence", []) or [])
+                catalog_hit_count = int(result.get("catalog_hit_count", 0) or 0)
+                catalog_titles = list(result.get("catalog_titles", []) or [])
 
                 if dk_code:
                     keyword_text = ", ".join(
@@ -5836,8 +6740,13 @@ class PipelineResultFormatter:
                     ancestor_path = repair_display_text(ancestor_path)
                     register = [cleaned for cleaned in (repair_display_text(item) for item in register) if cleaned]
                     validation_message = repair_display_text(validation_message)
+                    graph_evidence_lines = PipelineResultFormatter._format_graph_evidence_for_prompt(graph_evidence)
+                    catalog_titles = PipelineResultFormatter._filter_placeholder_titles(catalog_titles)
+                    has_graph_support = bool(source == "rvk_graph" or graph_evidence_lines or graph_joint_seed_count)
                     if classification_type == "RVK" and rvk_validation_status == "standard":
-                        if source == "rvk_api":
+                        if has_graph_support:
+                            source_text = "RVK-Graph (autoritaetsbasiert)"
+                        elif source == "rvk_api":
                             source_text = "RVK API (autoritaetsbasiert)"
                         elif source == "rvk_gnd_index":
                             source_text = "RVK MarcXML-GND-Index (autoritaetsbasiert)"
@@ -5850,6 +6759,17 @@ class PipelineResultFormatter:
                             entry += f"\nFachpfad: {ancestor_path}"
                         if register:
                             entry += f"\nRegister: {', '.join(map(str, register[:6]))}"
+                        if has_graph_support:
+                            if graph_joint_seed_count:
+                                entry += f"\nGraph-Seed-Abdeckung: {graph_joint_seed_count}"
+                            if graph_parent_distance is not None:
+                                entry += f"\nGraph-Distanz: {int(graph_parent_distance)}"
+                            if graph_evidence_lines:
+                                entry += f"\nGraph-Evidenz: {' | '.join(graph_evidence_lines)}"
+                            if catalog_hit_count:
+                                entry += f"\nKatalog-Abdeckung: {catalog_hit_count} Treffer (Klassifikationsindex)"
+                            if catalog_titles:
+                                entry += f"\nKatalog-Beispieltitel: {' | '.join(catalog_titles[:3])}"
                     elif source == "rvk_api":
                         entry = f"{classification_type}: {dk_code}\nKeywords: {keyword_text}\nQuelle: RVK API (autoritaetsbasiert)"
                         if label:

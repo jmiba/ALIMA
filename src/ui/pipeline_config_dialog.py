@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QMetaObject, Q_ARG
 from PyQt6.QtGui import QFont, QBrush, QColor
 from typing import Dict, List, Any, Optional
+from dataclasses import asdict
 import json
 import logging
 
@@ -175,9 +176,12 @@ class HybridStepConfigWidget(QWidget):
         parser = PipelineConfigParser()
         valid_tasks = parser.get_valid_tasks_for_step(self.step_id)
 
-        # If no tasks defined for this step, provide fallback
+        # Known non-LLM steps intentionally have no prompt task selection
+        if self.step_id in parser.STEP_TASK_MAPPING and not valid_tasks:
+            return []
+
+        # If a step is unknown to the parser, provide a safe fallback
         if not valid_tasks:
-            # Fallback to common tasks if step is not in mapping
             valid_tasks = ["keywords"]
             self.logger.debug(f"Step '{self.step_id}' not in parser mapping, using fallback task: {valid_tasks}")
 
@@ -191,7 +195,7 @@ class HybridStepConfigWidget(QWidget):
         # Clear and populate combo box
         self.task_combo.clear()
         if not available_tasks:
-            self.task_combo.addItem("No tasks available")
+            self.task_combo.addItem("No task required")
             self.task_combo.setEnabled(False)
             return
 
@@ -462,8 +466,9 @@ class HybridStepConfigWidget(QWidget):
         self.max_tokens_spinbox.valueChanged.connect(self._on_expert_config_changed)
         expert_layout.addWidget(self.max_tokens_spinbox, 2, 1)
 
-        # Thinking Mode (Ollama/OpenAI-compat think flag) - Claude Generated
-        expert_layout.addWidget(QLabel("Thinking Mode:"), 3, 0)
+        # Thinking Mode (currently only forwarded to Ollama providers)
+        self.think_label = QLabel("Thinking Mode:")
+        expert_layout.addWidget(self.think_label, 3, 0)
         self.think_checkbox = QCheckBox("Enable thinking (think=true)")
         self.think_checkbox.setTristate(True)
         self.think_checkbox.setCheckState(Qt.CheckState.PartiallyChecked)  # PartiallyChecked = not set (use default)
@@ -499,6 +504,60 @@ class HybridStepConfigWidget(QWidget):
         prompt_layout.addWidget(self.user_prompt_edit)
 
         layout.addWidget(self.prompt_editing_group)
+
+        # Step-specific settings that are not covered by the generic LLM controls
+        if self.step_id == "dk_search":
+            self.rvk_group = QGroupBox("📚 RVK Retrieval")
+            rvk_layout = QVBoxLayout(self.rvk_group)
+
+            rvk_info = QLabel(
+                "Dieser Schritt verwendet keine LLM-Prompt-Konfiguration. "
+                "Hier lassen sich nur katalogspezifische DK/RVK-Optionen steuern."
+            )
+            rvk_info.setWordWrap(True)
+            rvk_info.setStyleSheet("color: #666;")
+            rvk_layout.addWidget(rvk_info)
+
+            self.use_rvk_graph_retrieval_checkbox = QCheckBox(
+                "Graph-basierte RVK-Retrieval-Pipeline verwenden (Experimentell)"
+            )
+            self.use_rvk_graph_retrieval_checkbox.setToolTip(
+                "Schaltet die neue graph-basierte RVK-Retrieval-Pipeline für Tests frei.\n\n"
+                "Hinweis: Die aktuelle Implementierung initialisiert bereits das Graphschema,\n"
+                "verwendet zur Laufzeit aber weiterhin die klassische RVK-Suche/Fallback-Logik,\n"
+                "bis die Graphretrieval-Schritte vollständig integriert sind."
+            )
+            self.use_rvk_graph_retrieval_checkbox.toggled.connect(self._on_manual_config_changed)
+            rvk_layout.addWidget(self.use_rvk_graph_retrieval_checkbox)
+
+            rvk_hint = QLabel(
+                "Für kontrollierte Tests. Die klassische Retrieval-Logik bleibt derzeit der Runtime-Fallback."
+            )
+            rvk_hint.setWordWrap(True)
+            rvk_hint.setStyleSheet("color: #666; font-size: 10px;")
+            rvk_layout.addWidget(rvk_hint)
+
+            layout.addWidget(self.rvk_group)
+
+        if self.step_id == "dk_classification":
+            self.dk_group = QGroupBox("📘 DK-Klassifikation")
+            dk_layout = QGridLayout(self.dk_group)
+
+            dk_layout.addWidget(QLabel("Häufigkeits-Schwellenwert:"), 0, 0)
+            self.dk_frequency_spinbox = QSpinBox()
+            self.dk_frequency_spinbox.setMinimum(1)
+            self.dk_frequency_spinbox.setMaximum(100)
+            self.dk_frequency_spinbox.setValue(10)
+            self.dk_frequency_spinbox.setSuffix(" Vorkommen")
+            self.dk_frequency_spinbox.setToolTip(
+                "Mindest-Häufigkeit für Klassifikationen (DK/RVK).\n"
+                "Nur Klassifikationen mit ≥ N Vorkommen im Katalog\n"
+                "werden an das LLM weitergegeben."
+            )
+            self.dk_frequency_spinbox.valueChanged.connect(self._on_expert_config_changed)
+            dk_layout.addWidget(self.dk_frequency_spinbox, 0, 1)
+
+            layout.addWidget(self.dk_group)
 
         # Testing and Validation
         test_layout = QHBoxLayout()
@@ -537,15 +596,23 @@ class HybridStepConfigWidget(QWidget):
         # Smart group shows baseline (read-only), Advanced/Expert are override editors
         self.smart_group.setVisible(True)      # Baseline display
         if hasattr(self, 'manual_group'):
-            self.manual_group.setVisible(True)    # Override editor
+            self.manual_group.setVisible(self.step_id != "dk_search")    # Override editor
         if hasattr(self, 'expert_group'):
-            self.expert_group.setVisible(True)    # Override editor
+            self.expert_group.setVisible(self.step_id != "dk_search")    # Override editor
         if hasattr(self, 'prompt_editing_group'):
-            self.prompt_editing_group.setVisible(True)  # Override editor
+            self.prompt_editing_group.setVisible(self.step_id != "dk_search")  # Override editor
+        if hasattr(self, 'rvk_group'):
+            self.rvk_group.setVisible(self.step_id == "dk_search")
+        if hasattr(self, 'dk_group'):
+            self.dk_group.setVisible(self.step_id == "dk_classification")
 
         # Update status
-        self.status_label.setText("📋 Baseline + Override Configuration")
-        self.status_label.setStyleSheet("color: blue;")
+        if self.step_id == "dk_search":
+            self.status_label.setText("📚 Katalog-Recherche: katalogspezifische Optionen")
+            self.status_label.setStyleSheet("color: blue;")
+        else:
+            self.status_label.setText("📋 Baseline + Override Configuration")
+            self.status_label.setStyleSheet("color: blue;")
     
     def _populate_providers(self):
         """Populate provider and model combos - Claude Generated"""
@@ -606,6 +673,7 @@ class HybridStepConfigWidget(QWidget):
                 self.task_type_label.setStyleSheet("color: #d32f2f; font-weight: bold;")
 
             self.logger.error(f"Provider detection failed. User must check configuration before using this step.")
+            self._update_think_checkbox_availability(None)
     
     def _refresh_providers(self):
         """Refresh provider and model lists with current status - Claude Generated"""
@@ -722,6 +790,7 @@ class HybridStepConfigWidget(QWidget):
     def _on_provider_changed(self, provider: str):
         """Handle provider change with visual baseline highlighting - Claude Generated"""
         if not provider:
+            self._update_think_checkbox_availability(None)
             return
 
         try:
@@ -795,8 +864,54 @@ class HybridStepConfigWidget(QWidget):
                         self.model_combo.setItemData(self.model_combo.count() - 1, model, Qt.ItemDataRole.UserRole)
         except Exception as e:
             self.logger.warning(f"Could not load models for {provider}: {e}")
-        
+
+        self._update_think_checkbox_availability(provider)
         self._on_manual_config_changed()
+
+    def _update_think_checkbox_availability(self, provider: Optional[str]) -> None:
+        """Enable think only for providers where ALIMA currently forwards it."""
+        if not hasattr(self, "think_checkbox"):
+            return
+
+        supported = False
+        provider_label = provider or "aktueller Provider"
+
+        if provider:
+            provider_type = None
+            if self.config_manager:
+                try:
+                    unified_config = self.config_manager.get_unified_config()
+                    provider_obj = unified_config.get_provider_by_name(provider)
+                    if provider_obj:
+                        provider_type = provider_obj.provider_type
+                except Exception as exc:
+                    self.logger.debug(f"Could not resolve provider type for think support: {exc}")
+
+            if provider_type is None:
+                provider_type = "ollama" if "ollama" in provider.lower() else ""
+
+            supported = provider_type == "ollama"
+
+        if supported:
+            tooltip = (
+                "Thinking mode is forwarded for Ollama providers.\n"
+                "Partially checked (─) = provider default\n"
+                "Checked (✓) = think=true\n"
+                "Unchecked (☐) = think=false"
+            )
+            self.think_checkbox.setEnabled(True)
+            self.think_label.setStyleSheet("")
+            self.think_checkbox.setToolTip(tooltip)
+            self.think_label.setToolTip(tooltip)
+        else:
+            tooltip = (
+                f"Thinking mode is currently only forwarded to Ollama providers.\n"
+                f"For '{provider_label}', ALIMA ignores this setting at runtime."
+            )
+            self.think_checkbox.setEnabled(False)
+            self.think_label.setStyleSheet("color: #888;")
+            self.think_checkbox.setToolTip(tooltip)
+            self.think_label.setToolTip(tooltip)
     
     def _get_preferred_model_for_provider(self, provider: str) -> Optional[str]:
         """Get preferred model for provider with Task Preference priority - Claude Generated"""
@@ -993,6 +1108,13 @@ class HybridStepConfigWidget(QWidget):
     def _initialize_with_preferred_settings(self):
         """Initialize step config with Task Preference enhanced defaults - Claude Generated"""
         try:
+            if self.step_id == "dk_search":
+                # Catalog retrieval is a non-LLM step. Keep provider/model/task unset.
+                self.step_config.provider = None
+                self.step_config.model = None
+                self.step_config.task = None
+                return
+
             if not self.config_manager:
                 # If no config manager, just populate providers with defaults
                 self._populate_providers()
@@ -1123,6 +1245,14 @@ class HybridStepConfigWidget(QWidget):
     def _update_smart_preview(self):
         """Update smart mode preview with Task Preference integration - Claude Generated"""
         try:
+            if self.step_id == "dk_search":
+                self.smart_preview_label.setText(
+                    "📚 Nicht-LLM-Schritt: verwendet Katalog- und RVK-Retrieval-Einstellungen"
+                )
+                self.smart_preview_label.setStyleSheet("color: #555; font-style: italic;")
+                self.edit_preferences_button.setVisible(False)
+                return
+
             if self.config_manager:
                 smart_selector = SmartProviderSelector(self.config_manager)
                 prefer_fast = False  # Smart mode uses balanced approach
@@ -1262,6 +1392,18 @@ class HybridStepConfigWidget(QWidget):
     
     def _on_manual_config_changed(self):
         """Handle manual configuration changes with icon prefix handling - Claude Generated"""
+        if self.step_id == "dk_search":
+            self.step_config.provider = None
+            self.step_config.model = None
+            self.step_config.task = None
+            self.step_config.custom_params["use_rvk_graph_retrieval"] = (
+                self.use_rvk_graph_retrieval_checkbox.isChecked()
+                if hasattr(self, "use_rvk_graph_retrieval_checkbox")
+                else False
+            )
+            self.config_changed.emit()
+            return
+
         self.step_config.provider = self.provider_combo.currentText()
 
         # Get clean model name from UserRole (without icon prefix) - Claude Generated
@@ -1293,6 +1435,8 @@ class HybridStepConfigWidget(QWidget):
             self.step_config.think = True
         else:
             self.step_config.think = False
+        if hasattr(self, "dk_frequency_spinbox"):
+            self.step_config.custom_params["dk_frequency_threshold"] = self.dk_frequency_spinbox.value()
         self.config_changed.emit()
     
     def _validate_configuration(self):
@@ -1353,7 +1497,13 @@ class HybridStepConfigWidget(QWidget):
             "task": self.step_config.task or "",
             "temperature": getattr(self.step_config, 'temperature', 0.7),
             "top_p": getattr(self.step_config, 'top_p', 0.1),
+            "max_tokens": getattr(self.step_config, 'max_tokens', 2048),
         }
+
+        if getattr(self.step_config, "think", None) is not None:
+            config["think"] = self.step_config.think
+
+        custom_params = dict(getattr(self.step_config, "custom_params", {}) or {})
 
         # Validate critical parameters using unified parser
         if config.get("task"):
@@ -1377,6 +1527,17 @@ class HybridStepConfigWidget(QWidget):
 
         # Add task type information as metadata
         config["task_type"] = self.step_config.task_type.value if self.step_config.task_type else None
+
+        if hasattr(self, "use_rvk_graph_retrieval_checkbox"):
+            custom_params["use_rvk_graph_retrieval"] = self.use_rvk_graph_retrieval_checkbox.isChecked()
+            config["use_rvk_graph_retrieval"] = self.use_rvk_graph_retrieval_checkbox.isChecked()
+
+        if hasattr(self, "dk_frequency_spinbox"):
+            custom_params["dk_frequency_threshold"] = self.dk_frequency_spinbox.value()
+            config["dk_frequency_threshold"] = self.dk_frequency_spinbox.value()
+
+        if custom_params:
+            config["custom_params"] = custom_params
 
         return config
     
@@ -1407,7 +1568,15 @@ class HybridStepConfigWidget(QWidget):
             step_config.temperature = config.get("temperature", 0.7)
         if hasattr(step_config, 'top_p'):
             step_config.top_p = config.get("top_p", 0.1)
-        
+        if hasattr(step_config, 'max_tokens'):
+            step_config.max_tokens = config.get("max_tokens", 2048)
+        if "think" in config:
+            step_config.think = config.get("think")
+        step_config.custom_params = dict(config.get("custom_params", {}) or {})
+        for key in ["use_rvk_graph_retrieval", "dk_frequency_threshold"]:
+            if key in config:
+                step_config.custom_params[key] = config[key]
+
         # Apply the configuration
         self.set_step_config(step_config)
     
@@ -1428,7 +1597,7 @@ class HybridStepConfigWidget(QWidget):
             self._on_provider_changed(config.provider)
         if config.model:
             self.model_combo.setCurrentText(config.model)
-        if config.task:
+        if config.task and self.task_combo.isEnabled():
             self.task_combo.setCurrentText(config.task)
         
         # Update expert mode controls
@@ -1438,628 +1607,26 @@ class HybridStepConfigWidget(QWidget):
             self.top_p_spinbox.setValue(config.top_p)
         if config.max_tokens is not None:
             self.max_tokens_spinbox.setValue(config.max_tokens)
+        if hasattr(self, "think_checkbox"):
+            if config.think is None:
+                self.think_checkbox.setCheckState(Qt.CheckState.PartiallyChecked)
+            elif config.think:
+                self.think_checkbox.setCheckState(Qt.CheckState.Checked)
+            else:
+                self.think_checkbox.setCheckState(Qt.CheckState.Unchecked)
+        if hasattr(self, "use_rvk_graph_retrieval_checkbox"):
+            self.use_rvk_graph_retrieval_checkbox.setChecked(
+                bool(config.custom_params.get("use_rvk_graph_retrieval", False))
+            )
+        if hasattr(self, "dk_frequency_spinbox"):
+            self.dk_frequency_spinbox.setValue(
+                int(config.custom_params.get("dk_frequency_threshold", self.dk_frequency_spinbox.value()))
+            )
 
         self._update_ui_for_mode()
 
         # Update smart mode preview after configuration change - Claude Generated
         self._update_smart_preview()
-
-
-class PipelineStepConfigWidget(QWidget):
-    """Widget für die Konfiguration eines Pipeline-Schritts - Claude Generated"""
-
-    def __init__(
-        self,
-        step_name: str,
-        step_id: str,
-        llm_service: LlmService,
-        prompt_service: PromptService = None,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.step_name = step_name
-        self.step_id = step_id
-        self.llm_service = llm_service
-        self.prompt_service = prompt_service
-        self.logger = logging.getLogger(__name__)
-        self.config = {}  # Store the config for this step
-        self.setup_ui()
-
-    def setup_ui(self):
-        """Setup der UI für Step-Konfiguration - Claude Generated"""
-        layout = QVBoxLayout(self)
-
-        # Step Name Header
-        header_label = QLabel(self.step_name)
-        header_font = QFont()
-        header_font.setPointSize(12)
-        header_font.setBold(True)
-        header_label.setFont(header_font)
-        layout.addWidget(header_label)
-
-        # Provider & Model Selection
-        provider_group = QGroupBox("LLM-Einstellungen")
-        provider_layout = QGridLayout(provider_group)
-
-        # Provider Dropdown
-        provider_layout.addWidget(QLabel("Provider:"), 0, 0)
-        self.provider_combo = QComboBox()
-        providers = self.llm_service.get_available_providers()
-        self.provider_combo.addItems(providers)
-        self.provider_combo.currentTextChanged.connect(self.on_provider_changed)
-        provider_layout.addWidget(self.provider_combo, 0, 1)
-
-        # Model Dropdown
-        provider_layout.addWidget(QLabel("Modell:"), 1, 0)
-        self.model_combo = QComboBox()
-        self.model_combo.currentTextChanged.connect(self.load_prompt_settings)
-        provider_layout.addWidget(self.model_combo, 1, 1)
-
-        # Task Selection (for LLM steps)
-        if self.step_id in ["initialisation", "keywords"]:
-            provider_layout.addWidget(QLabel("Task:"), 2, 0)
-            self.task_combo = QComboBox()
-
-            # Define available tasks based on step
-            if self.step_id == "initialisation":
-                # Initial keyword extraction tasks
-                available_tasks = ["initialisation", "keywords", "rephrase"]
-            else:  # keywords step (final analysis)
-                # Final keyword analysis tasks - Claude Generated
-                # NOTE: "keywords_chunked" is only for chunking_task, NOT main task!
-                available_tasks = ["keywords", "rephrase"]
-
-            self.task_combo.addItems(available_tasks)
-            self.task_combo.currentTextChanged.connect(self.on_task_changed)
-            provider_layout.addWidget(self.task_combo, 2, 1)
-
-        # Enable/Disable for this step
-        self.enabled_checkbox = QCheckBox("Schritt aktivieren")
-        self.enabled_checkbox.setChecked(True)
-        self.enabled_checkbox.toggled.connect(self.on_enabled_changed)
-        provider_layout.addWidget(self.enabled_checkbox, 3, 0, 1, 2)
-
-        layout.addWidget(provider_group)
-
-        # Parameter Settings
-        params_group = QGroupBox("Parameter")
-        params_layout = QGridLayout(params_group)
-
-        # Temperature
-        params_layout.addWidget(QLabel("Temperatur:"), 0, 0)
-        self.temp_slider = QSlider(Qt.Orientation.Horizontal)
-        self.temp_slider.setRange(0, 100)
-        self.temp_slider.setValue(70)
-        self.temp_slider.valueChanged.connect(
-            lambda v: self.temp_spinbox.setValue(v / 100.0)
-        )
-        params_layout.addWidget(self.temp_slider, 0, 1)
-
-        self.temp_spinbox = QDoubleSpinBox()
-        self.temp_spinbox.setRange(0.0, 1.0)
-        self.temp_spinbox.setValue(0.7)
-        self.temp_spinbox.setDecimals(2)
-        self.temp_spinbox.setSingleStep(0.01)
-        self.temp_spinbox.valueChanged.connect(
-            lambda v: self.temp_slider.setValue(int(v * 100))
-        )
-        params_layout.addWidget(self.temp_spinbox, 0, 2)
-
-        # Top-P
-        params_layout.addWidget(QLabel("Top-P:"), 1, 0)
-        self.p_slider = QSlider(Qt.Orientation.Horizontal)
-        self.p_slider.setRange(0, 100)
-        self.p_slider.setValue(10)
-        self.p_slider.valueChanged.connect(lambda v: self.p_spinbox.setValue(v / 100.0))
-        params_layout.addWidget(self.p_slider, 1, 1)
-
-        self.p_spinbox = QDoubleSpinBox()
-        self.p_spinbox.setRange(0.0, 1.0)
-        self.p_spinbox.setValue(0.1)
-        self.p_spinbox.setDecimals(2)
-        self.p_spinbox.setSingleStep(0.01)
-        self.p_spinbox.valueChanged.connect(
-            lambda v: self.p_slider.setValue(int(v * 100))
-        )
-        params_layout.addWidget(self.p_spinbox, 1, 2)
-
-        # Repetition Penalty
-        params_layout.addWidget(QLabel("Repetition Penalty:"), 2, 0)
-        self.rep_penalty_slider = QSlider(Qt.Orientation.Horizontal)
-        self.rep_penalty_slider.setRange(100, 200)  # 1.00–2.00 mapped as integers
-        self.rep_penalty_slider.setValue(100)        # default 1.0
-        self.rep_penalty_slider.valueChanged.connect(lambda v: self.rep_penalty_spinbox.setValue(v / 100.0))
-        params_layout.addWidget(self.rep_penalty_slider, 2, 1)
-
-        self.rep_penalty_spinbox = QDoubleSpinBox()
-        self.rep_penalty_spinbox.setRange(1.0, 2.0)
-        self.rep_penalty_spinbox.setValue(1.0)
-        self.rep_penalty_spinbox.setDecimals(2)
-        self.rep_penalty_spinbox.setSingleStep(0.05)
-        self.rep_penalty_spinbox.setToolTip(
-            "Strafe für wiederholte Tokens.\n"
-            "1.0 = aus (Provider-Default)\n"
-            "Ollama: repeat_penalty, OpenAI: repetition_penalty\n"
-            "Gemini / Anthropic: wird ignoriert"
-        )
-        self.rep_penalty_spinbox.valueChanged.connect(
-            lambda v: self.rep_penalty_slider.setValue(int(v * 100))
-        )
-        params_layout.addWidget(self.rep_penalty_spinbox, 2, 2)
-
-        layout.addWidget(params_group)
-
-        # Iterative Refinement Section - PROMINENT PLACEMENT - Claude Generated
-        # Placed BEFORE chunking/DK params for better visibility
-        if self.step_id == "keywords":
-            refinement_group = QGroupBox("🔄 Iterative GND-Suche (Experimentell)")
-            refinement_group.setStyleSheet("QGroupBox { font-weight: bold; }")
-            refinement_layout = QVBoxLayout()
-
-            # Info label for visibility
-            info_label = QLabel(
-                "💡 <b>Neu:</b> Automatische Suche nach fehlenden Konzepten mit GND-Erweiterung"
-            )
-            info_label.setWordWrap(True)
-            info_label.setStyleSheet("color: #0066cc; padding: 5px;")
-            refinement_layout.addWidget(info_label)
-
-            self.enable_refinement = QCheckBox("✓ Iterative Suche aktivieren")
-            self.enable_refinement.setStyleSheet("font-weight: bold;")
-            self.enable_refinement.setToolTip(
-                "Wenn aktiviert, sucht das System nach fehlenden Konzepten\n"
-                "und erweitert den GND-Pool automatisch.\n\n"
-                "⚠️ Warnung: Erhöht Token-Nutzung um ca. 2-3x und\n"
-                "verlängert die Analysezeit um 30-70 Sekunden."
-            )
-            refinement_layout.addWidget(self.enable_refinement)
-
-            # Max iterations control
-            refinement_controls = QHBoxLayout()
-            refinement_controls.addWidget(QLabel("Max. Iterationen:"))
-            self.max_iterations_spin = QSpinBox()
-            self.max_iterations_spin.setRange(1, 5)
-            self.max_iterations_spin.setValue(2)
-            self.max_iterations_spin.setEnabled(False)
-            self.max_iterations_spin.setSuffix(" Durchläufe")
-            self.max_iterations_spin.setToolTip(
-                "Maximale Anzahl von Iterationen für die Suche\n"
-                "nach fehlenden Konzepten.\n\n"
-                "Empfohlen: 2 Iterationen\n"
-                "Höhere Werte erhöhen die Genauigkeit, aber auch die Kosten."
-            )
-
-            # Connect checkbox to enable/disable spinbox
-            self.enable_refinement.toggled.connect(self.max_iterations_spin.setEnabled)
-
-            refinement_controls.addWidget(self.max_iterations_spin)
-            refinement_controls.addStretch()
-
-            refinement_layout.addLayout(refinement_controls)
-
-            # Add warning banner
-            warning_label = QLabel("⚠️ Erhöht Token-Kosten um 2-3x")
-            warning_label.setStyleSheet("color: #ff6600; font-size: 10px; padding: 3px;")
-            refinement_layout.addWidget(warning_label)
-
-            refinement_group.setLayout(refinement_layout)
-            layout.addWidget(refinement_group)
-
-        # DK Classification Parameters (only for dk_classification step) - Claude Generated
-        if self.step_id == "dk_classification":
-            dk_group = QGroupBox("DK Klassifikation")
-            dk_layout = QGridLayout(dk_group)
-            
-            # DK Frequency Threshold
-            dk_layout.addWidget(QLabel("Häufigkeits-Schwellenwert:"), 0, 0)
-            self.dk_frequency_spinbox = QSpinBox()
-            self.dk_frequency_spinbox.setMinimum(1)
-            self.dk_frequency_spinbox.setMaximum(100)
-            self.dk_frequency_spinbox.setValue(10)  # Default value
-            self.dk_frequency_spinbox.setSuffix(" Vorkommen")
-            self.dk_frequency_spinbox.setToolTip(
-                "Mindest-Häufigkeit für Klassifikationen (DK/RVK).\n"
-                "Nur Klassifikationen mit ≥ N Vorkommen im Katalog\n"
-                "werden an das LLM weitergegeben.\n\n"
-                "Niedrigere Werte = mehr Ergebnisse\n"
-                "Höhere Werte = weniger, aber relevantere Ergebnisse"
-            )
-            dk_layout.addWidget(self.dk_frequency_spinbox, 0, 1)
-            
-            layout.addWidget(dk_group)
-
-        # Keyword Chunking Parameters (only for keywords step)
-        # Note: Chunking-Schwellwert is configured in Settings → Task Preferences → keywords
-        if self.step_id == "keywords":
-            chunking_group = QGroupBox("Keyword Chunking")
-            chunking_layout = QGridLayout(chunking_group)
-
-            # Chunking Task
-            chunking_layout.addWidget(QLabel("Chunking-Task:"), 0, 0)
-            self.chunking_task_combo = QComboBox()
-            self.chunking_task_combo.addItems(["keywords_chunked", "rephrase"])
-            self.chunking_task_combo.setCurrentText("keywords_chunked")
-            self.chunking_task_combo.setToolTip("Task für Chunk-Verarbeitung")
-            chunking_layout.addWidget(self.chunking_task_combo, 0, 1)
-
-            layout.addWidget(chunking_group)
-
-        # Debug: Add test button to load prompt settings
-        if self.step_id in ["initialisation", "keywords"]:
-            test_button = QPushButton("Test: Load Prompt Settings")
-            test_button.clicked.connect(self.test_load_prompt_settings)
-            layout.addWidget(test_button)
-
-        # Custom Prompt (if applicable)
-        if self.step_id in ["initialisation", "keywords", "dk_classification"]:
-            prompt_group = QGroupBox("Custom Prompts (optional)")
-            prompt_layout = QVBoxLayout(prompt_group)
-
-            # Main prompt
-            prompt_layout.addWidget(QLabel("Haupt-Prompt:"))
-            self.custom_prompt = QTextEdit()
-            self.custom_prompt.setMaximumHeight(80)
-            self.custom_prompt.setPlaceholderText("Leer lassen für Standard-Prompt...")
-            prompt_layout.addWidget(self.custom_prompt)
-
-            # System prompt
-            prompt_layout.addWidget(QLabel("System-Prompt:"))
-            self.system_prompt = QTextEdit()
-            self.system_prompt.setMaximumHeight(60)
-            self.system_prompt.setPlaceholderText(
-                "Leer lassen für Standard-System-Prompt..."
-            )
-            prompt_layout.addWidget(self.system_prompt)
-
-            layout.addWidget(prompt_group)
-
-        # Initialize models for default provider and load initial prompt settings
-        self.on_provider_changed(self.provider_combo.currentText())
-
-        # Load initial prompt settings after UI is fully set up
-        if hasattr(self, "task_combo"):
-            # Try immediate loading first
-            self.load_prompt_settings()
-            # Also set a timer as backup
-            QTimer.singleShot(100, self.load_prompt_settings)
-
-    def on_provider_changed(self, provider: str):
-        """Handle provider change - Claude Generated"""
-        self.model_combo.clear()
-        models = self.llm_service.get_available_models(provider)
-        if models:
-            self.model_combo.addItems(models)
-            
-            # --- START QUICK FIX ---
-            # Try to re-select the model that was saved in the config
-            saved_model = self.config.get("model")
-            if saved_model:
-                index = self.model_combo.findText(saved_model)
-                if index >= 0:
-                    self.model_combo.setCurrentIndex(index)
-            # --- END QUICK FIX ---
-
-        # Load prompt settings when provider changes
-        self.load_prompt_settings()
-
-    def on_task_changed(self, task: str):
-        """Handle task change - load settings from prompts.json - Claude Generated"""
-        self.load_prompt_settings()
-
-    def load_prompt_settings(self):
-        """Load prompt settings from prompts.json for current model/task - Claude Generated"""
-        if not self.prompt_service:
-            self.logger.warning("No prompt_service available for loading settings")
-            return
-        if not hasattr(self, "task_combo"):
-            self.logger.warning("No task_combo available for loading settings")
-            return
-
-        try:
-            current_task = self.task_combo.currentText()
-            current_model = self.model_combo.currentText()
-
-            self.logger.info(
-                f"Loading prompt settings for task='{current_task}', model='{current_model}'"
-            )
-            self.logger.info(
-                f"PromptService available: {self.prompt_service is not None}"
-            )
-
-            if current_task and current_model:
-                # Get prompt config for this task and model
-                prompt_config = self.prompt_service.get_prompt_config(
-                    current_task, current_model
-                )
-                self.logger.info(f"Found prompt config: {prompt_config is not None}")
-
-                if prompt_config:
-                    self.logger.info(
-                        f"Config details: temp={getattr(prompt_config, 'temp', 'N/A')}, p_value={getattr(prompt_config, 'p_value', 'N/A')}"
-                    )
-
-                if prompt_config:
-                    # Update temperature and top_p from prompt config
-                    if (
-                        hasattr(prompt_config, "temp")
-                        and prompt_config.temp is not None
-                    ):
-                        temp_value = float(prompt_config.temp)
-                        self.logger.info(f"Setting temperature to {temp_value}")
-
-                        # Use blockSignals to prevent recursion, more reliable than disconnect/reconnect
-                        self.temp_spinbox.blockSignals(True)
-                        self.temp_slider.blockSignals(True)
-
-                        self.temp_spinbox.setValue(temp_value)
-                        self.temp_slider.setValue(int(temp_value * 100))
-
-                        self.temp_spinbox.blockSignals(False)
-                        self.temp_slider.blockSignals(False)
-
-                        # Force repaint to ensure UI is updated
-                        self.temp_spinbox.repaint()
-                        self.temp_slider.repaint()
-
-                        # Also try processEvents to ensure immediate update
-                        from PyQt6.QtWidgets import QApplication
-
-                        QApplication.processEvents()
-
-                        self.logger.info(
-                            f"UI updated: spinbox={self.temp_spinbox.value()}, slider={self.temp_slider.value()}"
-                        )
-
-                    if (
-                        hasattr(prompt_config, "p_value")
-                        and prompt_config.p_value is not None
-                    ):
-                        p_value = float(prompt_config.p_value)
-                        self.logger.info(f"Setting p_value to {p_value}")
-
-                        # Use blockSignals to prevent recursion, more reliable than disconnect/reconnect
-                        self.p_spinbox.blockSignals(True)
-                        self.p_slider.blockSignals(True)
-
-                        self.p_spinbox.setValue(p_value)
-                        self.p_slider.setValue(int(p_value * 100))
-
-                        self.p_spinbox.blockSignals(False)
-                        self.p_slider.blockSignals(False)
-
-                        # Force repaint to ensure UI is updated
-                        self.p_spinbox.repaint()
-                        self.p_slider.repaint()
-
-                        # Also try processEvents to ensure immediate update
-                        from PyQt6.QtWidgets import QApplication
-
-                        QApplication.processEvents()
-
-                        self.logger.info(
-                            f"UI updated: p_spinbox={self.p_spinbox.value()}, p_slider={self.p_slider.value()}"
-                        )
-
-                    # Update custom prompt if available
-                    if hasattr(self, "custom_prompt") and hasattr(
-                        prompt_config, "prompt"
-                    ):
-                        # Don't overwrite if user has custom text, just show in placeholder
-                        if not self.custom_prompt.toPlainText().strip():
-                            self.custom_prompt.setPlaceholderText(
-                                f"Standard-Prompt für {current_task}"
-                            )
-
-                    # Update system prompt if available
-                    if hasattr(self, "system_prompt") and hasattr(
-                        prompt_config, "system"
-                    ):
-                        # Don't overwrite if user has custom text, just show in placeholder
-                        if not self.system_prompt.toPlainText().strip():
-                            self.system_prompt.setPlaceholderText(
-                                f"Standard-System-Prompt für {current_task}"
-                            )
-
-                    # Log the loaded settings for debugging
-                    if hasattr(self, "logger"):
-                        self.logger.info(
-                            f"Loaded prompt settings for {current_task}/{current_model}: temp={getattr(prompt_config, 'temp', 'N/A')}, p={getattr(prompt_config, 'p_value', 'N/A')}"
-                        )
-
-        except Exception as e:
-            if hasattr(self, "logger"):
-                self.logger.warning(f"Could not load prompt settings: {e}")
-
-    def test_load_prompt_settings(self):
-        """Test method to manually trigger prompt loading - Claude Generated"""
-        self.logger.info("=== MANUAL TEST: Loading prompt settings ===")
-        self.logger.info(
-            f"Current values: temp={self.temp_spinbox.value()}, p={self.p_spinbox.value()}"
-        )
-
-        # Test 1: Force set test values to verify UI works
-        self.logger.info("Test 1: Setting test values manually...")
-
-        self.temp_spinbox.blockSignals(True)
-        self.temp_slider.blockSignals(True)
-        self.p_spinbox.blockSignals(True)
-        self.p_slider.blockSignals(True)
-
-        self.temp_spinbox.setValue(0.25)
-        self.temp_slider.setValue(25)
-        self.p_spinbox.setValue(0.1)
-        self.p_slider.setValue(10)
-
-        self.temp_spinbox.blockSignals(False)
-        self.temp_slider.blockSignals(False)
-        self.p_spinbox.blockSignals(False)
-        self.p_slider.blockSignals(False)
-
-        # Force UI update
-        self.temp_spinbox.repaint()
-        self.temp_slider.repaint()
-        self.p_spinbox.repaint()
-        self.p_slider.repaint()
-
-        from PyQt6.QtWidgets import QApplication
-
-        QApplication.processEvents()
-
-        self.logger.info(
-            f"After manual set: temp={self.temp_spinbox.value()}, p={self.p_spinbox.value()}"
-        )
-
-        # Test 2: Try loading from prompt service
-        self.logger.info("Test 2: Loading from prompt service...")
-        self.load_prompt_settings()
-
-    def on_enabled_changed(self, enabled: bool):
-        """Enable/disable step configuration - Claude Generated"""
-        # Enable/disable all child widgets
-        for widget in self.findChildren(QWidget):
-            if widget != self.enabled_checkbox:
-                widget.setEnabled(enabled)
-
-    def get_config(self) -> Dict[str, Any]:
-        """Get current configuration - Claude Generated"""
-        config = {
-            "step_id": self.step_id,
-            "enabled": self.enabled_checkbox.isChecked(),
-            "provider": self.provider_combo.currentText(),
-            "model": self.model_combo.currentText(),
-            "temperature": self.temp_spinbox.value(),
-            "top_p": self.p_spinbox.value(),
-        }
-
-        # Add task if available
-        if hasattr(self, "task_combo"):
-            config["task"] = self.task_combo.currentText()
-
-        # Add custom prompt if available - this overrides defaults from prompts.json
-        if hasattr(self, "custom_prompt"):
-            custom_text = self.custom_prompt.toPlainText().strip()
-            if custom_text:
-                config["prompt_template"] = custom_text
-            # If no custom prompt, use the loaded prompt from prompts.json
-            elif self.prompt_service and hasattr(self, "task_combo"):
-                try:
-                    current_task = self.task_combo.currentText()
-                    current_model = self.model_combo.currentText()
-                    if current_task and current_model:
-                        prompt_config = self.prompt_service.get_prompt_config(
-                            current_task, current_model
-                        )
-                        if prompt_config and hasattr(prompt_config, "prompt"):
-                            config["prompt_template"] = prompt_config.prompt
-                except Exception as e:
-                    pass  # Fall back to default prompt
-
-        # Add system prompt if available - this overrides defaults from prompts.json
-        if hasattr(self, "system_prompt"):
-            system_text = self.system_prompt.toPlainText().strip()
-            if system_text:
-                config["system_prompt"] = system_text
-            # If no custom system prompt, use the loaded system prompt from prompts.json
-            elif self.prompt_service and hasattr(self, "task_combo"):
-                try:
-                    current_task = self.task_combo.currentText()
-                    current_model = self.model_combo.currentText()
-                    if current_task and current_model:
-                        prompt_config = self.prompt_service.get_prompt_config(
-                            current_task, current_model
-                        )
-                        if prompt_config and hasattr(prompt_config, "system"):
-                            config["system_prompt"] = prompt_config.system
-                except Exception as e:
-                    pass  # Fall back to default system prompt
-
-        # Repetition penalty — only store if != 1.0 (1.0 means "off")
-        rep_val = self.rep_penalty_spinbox.value()
-        if rep_val != 1.0:
-            config["repetition_penalty"] = rep_val
-
-        # Chunking task (keywords step only); threshold is in Task Preferences
-        if hasattr(self, "chunking_task_combo"):
-            config["chunking_task"] = self.chunking_task_combo.currentText()
-            
-        # Add DK classification parameters if available (dk_classification step only) - Claude Generated
-        if hasattr(self, "dk_frequency_spinbox"):
-            config["dk_frequency_threshold"] = self.dk_frequency_spinbox.value()
-
-        # Add iterative refinement parameters if available (keywords step only) - Claude Generated
-        if hasattr(self, "enable_refinement"):
-            config["enable_iterative_refinement"] = self.enable_refinement.isChecked()
-        if hasattr(self, "max_iterations_spin"):
-            config["max_refinement_iterations"] = self.max_iterations_spin.value()
-
-        return config
-
-    def set_config(self, config: Dict[str, Any]):
-        """Set configuration - Claude Generated"""
-        self.config = config
-        if "enabled" in config:
-            self.enabled_checkbox.setChecked(config["enabled"])
-
-        if "provider" in config:
-            index = self.provider_combo.findText(config["provider"])
-            if index >= 0:
-                self.provider_combo.setCurrentIndex(index)
-
-        if "model" in config:
-            index = self.model_combo.findText(config["model"])
-            if index >= 0:
-                self.model_combo.setCurrentIndex(index)
-
-        if "temperature" in config:
-            temp_value = config["temperature"]
-            self.temp_spinbox.setValue(temp_value)
-            # Update slider to match
-            self.temp_slider.setValue(int(temp_value * 100))
-
-        if "top_p" in config:
-            p_value = config["top_p"]
-            self.p_spinbox.setValue(p_value)
-            # Update slider to match
-            self.p_slider.setValue(int(p_value * 100))
-
-        if "task" in config and hasattr(self, "task_combo"):
-            index = self.task_combo.findText(config["task"])
-            if index >= 0:
-                self.task_combo.setCurrentIndex(index)
-
-        if "prompt_template" in config and hasattr(self, "custom_prompt"):
-            self.custom_prompt.setPlainText(config["prompt_template"])
-        elif "custom_prompt" in config and hasattr(self, "custom_prompt"):
-            self.custom_prompt.setPlainText(config["custom_prompt"])
-
-        if "system_prompt" in config and hasattr(self, "system_prompt"):
-            self.system_prompt.setPlainText(config["system_prompt"])
-
-        # Repetition penalty
-        if "repetition_penalty" in config:
-            self.rep_penalty_spinbox.setValue(config["repetition_penalty"])
-
-        if "chunking_task" in config and hasattr(self, "chunking_task_combo"):
-            index = self.chunking_task_combo.findText(config["chunking_task"])
-            if index >= 0:
-                self.chunking_task_combo.setCurrentIndex(index)
-                
-        # Set DK classification parameters if available (dk_classification step only) - Claude Generated
-        if "dk_frequency_threshold" in config and hasattr(self, "dk_frequency_spinbox"):
-            self.dk_frequency_spinbox.setValue(config["dk_frequency_threshold"])
-
-        # Set iterative refinement parameters if available (keywords step only) - Claude Generated
-        if "enable_iterative_refinement" in config and hasattr(self, "enable_refinement"):
-            self.enable_refinement.setChecked(config["enable_iterative_refinement"])
-        if "max_refinement_iterations" in config and hasattr(self, "max_iterations_spin"):
-            self.max_iterations_spin.setValue(config["max_refinement_iterations"])
-
-        # Load prompt settings after config is set (with delay to ensure UI is updated)
-        if hasattr(self, "task_combo") and not (
-            "temperature" in config or "top_p" in config
-        ):
-            # Only load prompt settings if temperature/top_p weren't explicitly set in config
-            QTimer.singleShot(50, self.load_prompt_settings)
 
 
 class PipelineConfigDialog(QDialog):
@@ -2136,6 +1703,7 @@ class PipelineConfigDialog(QDialog):
             ("initialisation", "🔤 Initialisierung"),
             ("search", "🔍 Suche"),
             ("keywords", "✅ Schlagworte"),
+            ("dk_search", "📊 Katalog-Recherche"),
             ("dk_classification", "📚 DK-Klassifikation"),
         ]
 
@@ -2287,8 +1855,12 @@ class PipelineConfigDialog(QDialog):
                             'task': step_config.task or '',
                             'temperature': step_config.temperature or 0.7,
                             'top_p': step_config.top_p or 0.1,
-                            'max_tokens': step_config.max_tokens
+                            'max_tokens': step_config.max_tokens,
+                            'think': step_config.think,
+                            'enable_iterative_refinement': step_config.enable_iterative_refinement,
+                            'max_refinement_iterations': step_config.max_refinement_iterations,
                         }
+                        config_dict.update(step_config.custom_params or {})
                         step_widget.set_config(config_dict)
                 elif step_id == "search":
                     # Load search suggesters from PipelineConfig
@@ -2333,6 +1905,16 @@ class PipelineConfigDialog(QDialog):
             # Return dict as-is for search (it doesn't use PipelineStepConfig)
             return config_dict
 
+        custom_params = dict(config_dict.get("custom_params", {}) or {})
+        for key in [
+            "keyword_chunking_threshold",
+            "chunking_task",
+            "dk_frequency_threshold",
+            "use_rvk_graph_retrieval",
+        ]:
+            if key in config_dict:
+                custom_params[key] = config_dict[key]
+
         # Extract fields that PipelineStepConfig expects
         return PipelineStepConfig(
             step_id=step_id,
@@ -2346,63 +1928,69 @@ class PipelineConfigDialog(QDialog):
             seed=config_dict.get("seed"),
             repetition_penalty=config_dict.get("repetition_penalty"),
             think=config_dict.get("think"),
-            custom_params=config_dict.get("custom_params", {}),
+            custom_params=custom_params,
             task_type=config_dict.get("task_type"),
+            enable_iterative_refinement=config_dict.get("enable_iterative_refinement", False),
+            max_refinement_iterations=config_dict.get("max_refinement_iterations", 2),
+        )
+
+    def get_config(self) -> PipelineConfig:
+        """Build the current pipeline configuration from the dialog state."""
+        step_configs = {}
+        search_suggesters = ["lobid", "swb"]
+
+        for step_id, step_widget in self.step_widgets.items():
+            if step_id == "search":
+                config = step_widget.get_config()
+                if "suggesters" in config:
+                    search_suggesters = config["suggesters"]
+                step_configs[step_id] = config
+                continue
+
+            widget_config = step_widget.get_config()
+
+            has_provider_override = widget_config.get("provider") not in ("", None)
+            has_model_override = widget_config.get("model") not in ("", None)
+            non_baseline_keys = {
+                key for key, value in widget_config.items()
+                if key not in {"step_id", "enabled", "provider", "model"} and value not in ("", None)
+            }
+            has_step_specific_override = bool(non_baseline_keys)
+
+            if has_provider_override or has_model_override or has_step_specific_override:
+                step_configs[step_id] = widget_config
+                self.logger.info(
+                    f"Step '{step_id}': applying UI overrides "
+                    f"(provider={widget_config.get('provider')}, model={widget_config.get('model')}, "
+                    f"custom={sorted(non_baseline_keys)})"
+                )
+            else:
+                step_configs[step_id] = {
+                    "step_id": step_id,
+                    "enabled": widget_config.get("enabled", True),
+                    "provider": None,
+                    "model": None,
+                }
+                self.logger.info(f"Step '{step_id}': using smart baseline (no overrides)")
+
+        step_configs_converted = {}
+        for step_id, config_data in step_configs.items():
+            if isinstance(config_data, dict):
+                step_configs_converted[step_id] = self._dict_to_pipeline_step_config(config_data, step_id)
+            else:
+                step_configs_converted[step_id] = config_data
+
+        return PipelineConfig(
+            auto_advance=self.auto_advance_checkbox.isChecked(),
+            stop_on_error=self.stop_on_error_checkbox.isChecked(),
+            step_configs=step_configs_converted,
+            search_suggesters=search_suggesters,
         )
 
     def save_config(self):
         """Save configuration using baseline + override pattern - Claude Generated"""
         try:
-            # Step 1: Create smart baseline configuration
-            if self.config_manager:
-                # Use smart provider preferences as baseline
-                baseline_config = PipelineConfig.create_from_provider_preferences(self.config_manager)
-            else:
-                # Fallback to default configuration
-                baseline_config = PipelineConfig()
-
-            # Step 2: Apply UI overrides for each step
-            step_configs = {}
-            search_suggesters = ["lobid", "swb"]  # Default
-
-            for step_id, step_widget in self.step_widgets.items():
-                if step_id == "search":
-                    # Handle search step (no LLM configuration)
-                    config = step_widget.get_config()
-                    if "suggesters" in config:
-                        search_suggesters = config["suggesters"]
-                    step_configs[step_id] = config
-                else:
-                    # Handle LLM steps with baseline + override logic
-                    widget_config = step_widget.get_config()
-
-                    # Check if user made manual selections (overrides)
-                    has_provider_override = widget_config.get("provider") and widget_config["provider"] != ""
-                    has_model_override = widget_config.get("model") and widget_config["model"] != ""
-
-                    if has_provider_override or has_model_override:
-                        # User made manual selections -> apply as overrides
-                        step_configs[step_id] = widget_config
-                        self.logger.info(f"Step '{step_id}': applying UI overrides (provider={widget_config.get('provider')}, model={widget_config.get('model')})")
-                    else:
-                        # No manual selections -> use baseline (smart selection)
-                        # Create minimal config that will trigger smart selection
-                        step_configs[step_id] = {
-                            "step_id": step_id,
-                            "enabled": widget_config.get("enabled", True),
-                            "provider": None,  # Will use smart selection
-                            "model": None      # Will use smart selection
-                        }
-                        self.logger.info(f"Step '{step_id}': using smart baseline (no overrides)")
-
-            # Step 3: Convert dict configs to PipelineStepConfig objects - Claude Generated
-            step_configs_converted = {}
-            for step_id, config_data in step_configs.items():
-                if isinstance(config_data, dict):
-                    step_configs_converted[step_id] = self._dict_to_pipeline_step_config(config_data, step_id)
-                else:
-                    # Already a PipelineStepConfig object
-                    step_configs_converted[step_id] = config_data
+            final_config = self.get_config()
 
             # Step 4: Save Pipeline Default settings to unified config - Claude Generated
             if self.config_manager:
@@ -2418,14 +2006,6 @@ class PipelineConfigDialog(QDialog):
                     self.logger.info(f"Pipeline defaults saved: {unified_config.pipeline_default_provider}/{unified_config.pipeline_default_model}")
                 except Exception as e:
                     self.logger.warning(f"Error saving pipeline defaults: {e}")
-
-            # Step 5: Create final configuration with converted objects
-            final_config = PipelineConfig(
-                auto_advance=self.auto_advance_checkbox.isChecked(),
-                stop_on_error=self.stop_on_error_checkbox.isChecked(),
-                step_configs=step_configs_converted,
-                search_suggesters=search_suggesters,
-            )
 
             self.logger.info("Configuration saved using baseline + override pattern")
             self.config_saved.emit(final_config)
@@ -2498,12 +2078,32 @@ class PipelineConfigDialog(QDialog):
             
             # Update provider preferences based on pipeline step configurations
             step_configs = current_config.step_configs
+
+            def _step_enabled(step_config) -> bool:
+                if isinstance(step_config, dict):
+                    return bool(step_config.get("enabled", True))
+                return bool(getattr(step_config, "enabled", True))
+
+            def _step_provider(step_config) -> str:
+                if isinstance(step_config, dict):
+                    return step_config.get("provider") or ""
+                return getattr(step_config, "provider", "") or ""
+
+            def _step_model(step_config) -> str:
+                if isinstance(step_config, dict):
+                    return step_config.get("model") or ""
+                return getattr(step_config, "model", "") or ""
+
+            def _serialize_step_config(step_config) -> Dict[str, Any]:
+                if isinstance(step_config, dict):
+                    return dict(step_config)
+                return asdict(step_config)
             
             # Determine the most frequently used provider as preferred
             provider_counts = {}
             for step_config in step_configs.values():
-                if step_config.provider and step_config.enabled:
-                    provider = step_config.provider
+                provider = _step_provider(step_config)
+                if provider and _step_enabled(step_config):
                     provider_counts[provider] = provider_counts.get(provider, 0) + 1
             
             if provider_counts:
@@ -2520,75 +2120,55 @@ class PipelineConfigDialog(QDialog):
                     if provider not in new_priority:
                         new_priority.append(provider)
                 unified_config.provider_priority = new_priority
+
+            # Persist pipeline-standard settings so they survive app restart
+            unified_config.pipeline_default_provider = self.default_provider_combo.currentData() or ""
+            unified_config.pipeline_default_model = self.default_model_combo.currentData() or ""
+            unified_config.pipeline_auto_advance = current_config.auto_advance
+            unified_config.pipeline_stop_on_error = current_config.stop_on_error
+            unified_config.pipeline_search_suggesters = list(current_config.search_suggesters or ["lobid", "swb"])
+            unified_config.pipeline_step_defaults = {
+                step_id: _serialize_step_config(step_config)
+                for step_id, step_config in step_configs.items()
+                if step_id != "search"
+            }
             
             # Update task-specific overrides based on pipeline config
-            if 'initialisation' in step_configs and step_configs['initialisation'].enabled:
+            if 'initialisation' in step_configs and _step_enabled(step_configs['initialisation']):
                 # Fast text provider for initialization
-                init_provider = step_configs['initialisation'].provider
+                init_provider = _step_provider(step_configs['initialisation'])
                 if init_provider:
                     # TODO: Implement task-specific provider overrides in UnifiedProviderConfig
                     pass  # Disabled until proper implementation
                     
-            if 'keywords' in step_configs and step_configs['keywords'].enabled:
+            if 'keywords' in step_configs and _step_enabled(step_configs['keywords']):
                 # Quality text provider for final analysis
-                keywords_provider = step_configs['keywords'].provider
+                keywords_provider = _step_provider(step_configs['keywords'])
                 if keywords_provider:
                     # TODO: Implement task-specific provider overrides in UnifiedProviderConfig
                     pass  # Disabled until proper implementation
                     
-            if 'dk_classification' in step_configs and step_configs['dk_classification'].enabled:
+            if 'dk_classification' in step_configs and _step_enabled(step_configs['dk_classification']):
                 # Classification-specific provider
-                classification_provider = step_configs['dk_classification'].provider
+                classification_provider = _step_provider(step_configs['dk_classification'])
                 if classification_provider:
                     # TODO: Implement task-specific provider overrides in UnifiedProviderConfig
                     pass  # Disabled until proper implementation
             
             # Update preferred models per provider
             for step_config in step_configs.values():
-                if step_config.provider and step_config.model and step_config.enabled:
-                    provider = step_config.provider
-                    model = step_config.model
-                    if provider and model:
-                        # TODO: Implement preferred_models in UnifiedProviderConfig
-                        pass  # Disabled until proper implementation
+                provider = _step_provider(step_config)
+                model = _step_model(step_config)
+                if provider and model and _step_enabled(step_config):
+                    # TODO: Implement preferred_models in UnifiedProviderConfig
+                    pass  # Disabled until proper implementation
             
-            # TODO: Implement validation in UnifiedProviderConfig if needed
-            # if self.smart_selector:
-            #     validation_issues = unified_config.validate_preferences(self.smart_selector.provider_detection_service)
-            # TODO: Re-implement validation block when UnifiedProviderConfig supports validation\n            if False:  # Disabled: any(validation_issues.values()):
-                    # Show validation issues but allow saving
-                    issues_text = ""
-                    for category, issues in validation_issues.items():
-                        if issues:
-                            category_name = category.replace('_', ' ').title()
-                            issues_text += f"**{category_name}:**\n"
-                            for issue in issues[:3]:  # Show first 3 issues
-                                issues_text += f"  • {issue}\n"
-                            if len(issues) > 3:
-                                issues_text += f"  • ... und {len(issues) - 3} weitere\n"
-                            issues_text += "\n"
-                    
-                    reply = QMessageBox.question(
-                        self,
-                        "Konfigurationsvalidierung",
-                        f"⚠️ Einige Provider-Einstellungen haben Probleme:\n\n{issues_text}"
-                        f"Möchten Sie trotzdem speichern? (Auto-Cleanup wird durchgeführt)",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.Yes
-                    )
-                    
-                    if reply == QMessageBox.StandardButton.No:
-                        return
-                    
-                    # Perform auto-cleanup
-                    # TODO: Implement cleanup in UnifiedProviderConfig
-                    # cleanup_report = unified_config.auto_cleanup(self.smart_selector.provider_detection_service)
-                    cleanup_report = {}
-                    if cleanup_report and any(cleanup_report.values()):
-                        self.logger.info("Auto-cleanup performed during provider preferences save")
+            # Validation/cleanup for unified provider preferences is not implemented yet.
             
-            # Save updated config directly
-            self.config_manager.save_config()
+            # Save updated unified config directly
+            config = self.config_manager.load_config(force_reload=True)
+            config.unified_config = unified_config
+            self.config_manager.save_config(config)
             
             # Success message with summary
             success_message = "✅ Provider-Einstellungen erfolgreich gespeichert!\n\n"
@@ -2597,7 +2177,7 @@ class PipelineConfigDialog(QDialog):
             if len(unified_config.provider_priority) > 3:
                 success_message += f" (+{len(unified_config.provider_priority) - 3} weitere)"
             success_message += f"\n🚀 Konfiguration erfolgreich gespeichert\n\n"
-            success_message += "Diese Einstellungen werden jetzt als Standardwerte für alle ALIMA-Funktionen verwendet."
+            success_message += "Die aktuellen Pipeline-Einstellungen werden beim nächsten Start wiederhergestellt."
             
             QMessageBox.information(self, "Erfolgreich gespeichert", success_message)
             

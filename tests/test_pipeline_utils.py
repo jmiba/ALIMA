@@ -5,7 +5,7 @@ import unittest
 import json
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -43,6 +43,76 @@ class TestPipelineStepExecutor(unittest.TestCase):
             cache_manager=self.mock_cache_manager,
             logger=self.mock_logger,
         )
+
+    def _make_task_state(self, response_text: str, status: str = "completed") -> TaskState:
+        return TaskState(
+            abstract_data=AbstractData(abstract="Abstract", keywords=""),
+            analysis_result=AnalysisResult(
+                full_text=response_text,
+                matched_keywords={},
+                gnd_systematic="",
+            ),
+            prompt_config=PromptConfigData(
+                prompt="Prompt",
+                system="System",
+                temp=0.0,
+                p_value=1.0,
+                models=["test-model"],
+                seed=None,
+                output_format="xml",
+            ),
+            status=status,
+            task_name="dk_classification",
+            model_used="test-model",
+            provider_used="test-provider",
+        )
+
+    @staticmethod
+    def _candidate_pool():
+        return [
+            {
+                "dk": "720",
+                "classification_type": "DK",
+                "type": "DK",
+                "count": 80,
+                "matched_keywords": ["Architektur", "Klassizismus"],
+                "titles": ["Titel A", "Titel B"],
+            },
+            {
+                "dk": "56.63",
+                "classification_type": "DK",
+                "type": "DK",
+                "count": 28,
+                "matched_keywords": ["Profanarchitektur"],
+                "titles": ["Titel C"],
+            },
+            {
+                "dk": "LI 99999",
+                "classification_type": "RVK",
+                "type": "RVK",
+                "count": 29,
+                "matched_keywords": ["Klassizismus", "Architekturzeichnung"],
+                "titles": [],
+                "label": "Klassizistische Architektur",
+                "ancestor_path": "Kunst > Architekturgeschichte",
+                "branch_family": "L",
+                "rvk_validation_status": "standard",
+                "source": "rvk_graph",
+            },
+            {
+                "dk": "LH 60320",
+                "classification_type": "RVK",
+                "type": "RVK",
+                "count": 26,
+                "matched_keywords": ["Profanarchitektur", "Architektur"],
+                "titles": [],
+                "label": "Profanarchitektur",
+                "ancestor_path": "Kunst > Baukunst",
+                "branch_family": "L",
+                "rvk_validation_status": "standard",
+                "source": "catalog",
+            },
+        ]
 
     def test_execute_initial_keyword_extraction(self):
         mock_task_state = TaskState(
@@ -195,6 +265,262 @@ class TestPipelineStepExecutor(unittest.TestCase):
             self.assertEqual(payload["results"]["classifications"][0]["system"], "RVK")
         finally:
             os.unlink(path)
+
+    def test_execute_dk_classification_keeps_valid_llm_result(self):
+        self.mock_alima_manager.analyze_abstract.return_value = self._make_task_state(
+            "<final_list>DK 720 | RVK LI 99999</final_list>"
+        )
+        self.executor._select_final_dk_candidates = Mock(return_value=["DK 56.63"])
+        self.executor._select_final_rvk_candidates = Mock(return_value=["RVK LH 60320"])
+        self.executor._select_final_rvk_with_dk_context = Mock(return_value=[])
+        self.executor._should_skip_dk_guided_rvk_second_pass = Mock(return_value=(False, [], ""))
+
+        classifications, llm_analysis = self.executor.execute_dk_classification(
+            original_abstract="Architektur und Klassizismus",
+            dk_search_results=self._candidate_pool(),
+            model="test-model",
+            provider="test-provider",
+        )
+
+        self.assertEqual(classifications, ["DK 720", "RVK LI 99999"])
+        self.assertEqual(llm_analysis.extracted_gnd_classes, ["DK 720", "RVK LI 99999"])
+
+    def test_execute_dk_classification_uses_fallback_when_llm_returns_no_classes(self):
+        self.mock_alima_manager.analyze_abstract.return_value = self._make_task_state(
+            "Analyse ohne verwertbare finale Klassen."
+        )
+        self.executor._select_final_dk_candidates = Mock(return_value=["DK 720"])
+        self.executor._select_final_rvk_candidates = Mock(return_value=["RVK LI 99999"])
+        self.executor._select_final_rvk_with_dk_context = Mock(return_value=[])
+        self.executor._should_skip_dk_guided_rvk_second_pass = Mock(return_value=(False, [], ""))
+        stream_callback = Mock()
+
+        classifications, llm_analysis = self.executor.execute_dk_classification(
+            original_abstract="Architektur und Klassizismus",
+            dk_search_results=self._candidate_pool(),
+            model="test-model",
+            provider="test-provider",
+            stream_callback=stream_callback,
+        )
+
+        self.assertEqual(classifications, ["DK 720", "RVK LI 99999"])
+        self.assertEqual(llm_analysis.extracted_gnd_classes, ["DK 720", "RVK LI 99999"])
+        streamed_text = "".join(call.args[0] for call in stream_callback.call_args_list)
+        self.assertIn("LLM lieferte keine finalen Klassen", streamed_text)
+        self.assertIn("Finale DK-Auswahl aus Fallback", streamed_text)
+        self.assertIn("Finale RVK-Auswahl aus Fallback", streamed_text)
+
+    def test_execute_dk_classification_tops_up_missing_rvk_from_fallback(self):
+        self.mock_alima_manager.analyze_abstract.return_value = self._make_task_state(
+            "<final_list>DK 720</final_list>"
+        )
+        self.executor._select_final_dk_candidates = Mock(return_value=["DK 56.63"])
+        self.executor._select_final_rvk_candidates = Mock(return_value=["RVK LI 99999"])
+        self.executor._select_final_rvk_with_dk_context = Mock(return_value=[])
+        self.executor._should_skip_dk_guided_rvk_second_pass = Mock(return_value=(False, [], ""))
+
+        classifications, _ = self.executor.execute_dk_classification(
+            original_abstract="Architektur und Klassizismus",
+            dk_search_results=self._candidate_pool(),
+            model="test-model",
+            provider="test-provider",
+        )
+
+        self.assertEqual(classifications, ["DK 720", "RVK LI 99999"])
+
+    def test_execute_dk_classification_tops_up_missing_dk_from_fallback(self):
+        self.mock_alima_manager.analyze_abstract.return_value = self._make_task_state(
+            "<final_list>RVK LI 99999</final_list>"
+        )
+        self.executor._select_final_dk_candidates = Mock(return_value=["DK 720"])
+        self.executor._select_final_rvk_candidates = Mock(return_value=["RVK LH 60320"])
+        self.executor._select_final_rvk_with_dk_context = Mock(return_value=[])
+        self.executor._should_skip_dk_guided_rvk_second_pass = Mock(return_value=(False, [], ""))
+
+        classifications, _ = self.executor.execute_dk_classification(
+            original_abstract="Architektur und Klassizismus",
+            dk_search_results=self._candidate_pool(),
+            model="test-model",
+            provider="test-provider",
+        )
+
+        self.assertEqual(classifications, ["DK 720", "RVK LI 99999"])
+
+    def test_execute_dk_classification_restores_filtered_rvk_from_fallback(self):
+        self.mock_alima_manager.analyze_abstract.return_value = self._make_task_state(
+            "<final_list>DK 720 | RVK ZZ 12345</final_list>"
+        )
+        self.executor._select_final_dk_candidates = Mock(return_value=["DK 56.63"])
+        self.executor._select_final_rvk_candidates = Mock(return_value=["RVK LI 99999"])
+        self.executor._select_final_rvk_with_dk_context = Mock(return_value=[])
+        self.executor._should_skip_dk_guided_rvk_second_pass = Mock(return_value=(False, [], ""))
+
+        classifications, _ = self.executor.execute_dk_classification(
+            original_abstract="Architektur und Klassizismus",
+            dk_search_results=self._candidate_pool(),
+            model="test-model",
+            provider="test-provider",
+        )
+
+        self.assertEqual(classifications, ["DK 720", "RVK LI 99999"])
+
+    def test_execute_dk_classification_does_not_forward_graph_flag_to_alima_manager(self):
+        self.mock_alima_manager.analyze_abstract.return_value = self._make_task_state(
+            "<final_list>DK 720 | RVK LI 99999</final_list>"
+        )
+        self.executor._select_final_dk_candidates = Mock(return_value=["DK 56.63"])
+        self.executor._select_final_rvk_candidates = Mock(return_value=["RVK LH 60320"])
+        self.executor._select_final_rvk_with_dk_context = Mock(return_value=[])
+        self.executor._should_skip_dk_guided_rvk_second_pass = Mock(return_value=(False, [], ""))
+
+        classifications, _ = self.executor.execute_dk_classification(
+            original_abstract="Architektur und Klassizismus",
+            dk_search_results=self._candidate_pool(),
+            model="test-model",
+            provider="test-provider",
+            use_rvk_graph_retrieval=True,
+        )
+
+        self.assertEqual(classifications, ["DK 720", "RVK LI 99999"])
+        _, call_kwargs = self.mock_alima_manager.analyze_abstract.call_args
+        self.assertNotIn("use_rvk_graph_retrieval", call_kwargs)
+
+    def test_format_dk_results_for_prompt_includes_graph_evidence_for_rvk(self):
+        from src.utils.pipeline_utils import PipelineResultFormatter
+
+        prompt_text = PipelineResultFormatter.format_dk_results_for_prompt(
+            [
+                {
+                    "dk": "LK 79000",
+                    "classification_type": "RVK",
+                    "count": 4,
+                    "titles": [],
+                    "matched_keywords": ["Architektur", "Klassizismus"],
+                    "source": "rvk_graph",
+                    "label": "Allgemeine geschichtliche Darstellungen, Handbücher",
+                    "ancestor_path": "Kunstgeschichte > Deutschland > Architektur",
+                    "register": ["Architektur", "Klassizismus"],
+                    "rvk_validation_status": "standard",
+                    "graph_joint_seed_count": 2,
+                    "graph_parent_distance": 1,
+                    "catalog_hit_count": 7,
+                    "graph_evidence": [
+                        {
+                            "seed": "Architektur",
+                            "seed_type": "gnd",
+                            "match_type": "direct_concept",
+                            "weight": 1.72,
+                            "path": ["Architektur", "LK 79000"],
+                        },
+                        {
+                            "seed": "Klassizismus",
+                            "seed_type": "anchor",
+                            "match_type": "ancestor",
+                            "weight": 0.47,
+                            "path": ["Klassizismus", "LK 95190", "LK 79000"],
+                        },
+                    ],
+                }
+            ]
+        )
+
+        self.assertIn("Quelle: RVK-Graph", prompt_text)
+        self.assertIn("Graph-Seed-Abdeckung: 2", prompt_text)
+        self.assertIn("Graph-Evidenz:", prompt_text)
+        self.assertIn("Architektur: direkter GND-Treffer", prompt_text)
+        self.assertIn("Katalog-Abdeckung: 7 Treffer", prompt_text)
+
+    def test_enrich_graph_rvk_results_with_catalog_evidence_adds_catalog_hit_count(self):
+        lookup = Mock()
+        lookup.get_rsns_for_classification.side_effect = lambda classification: [101, 102, 102] if classification == "RVK LK 79000" else []
+        lookup.get_titles_for_classification.return_value = [
+            {"title": "Catalog Entry for RSN 101", "classifications": ["RVK LK 79000"]},
+            {"title": "Catalog Entry for RSN 102", "classifications": ["RVK LK 79000"]},
+        ]
+
+        keyword_results = [
+            {
+                "keyword": "Architektur",
+                "classifications": [
+                    {
+                        "dk": "LK 79000",
+                        "classification_type": "RVK",
+                        "source": "rvk_graph",
+                        "graph_joint_seed_count": 2,
+                        "graph_evidence": [{"seed": "Architektur", "match_type": "direct_concept", "path": ["Architektur", "LK 79000"]}],
+                    }
+                ],
+            }
+        ]
+
+        with patch("src.utils.classification_lookup_service.get_classification_lookup_service", return_value=lookup):
+            enriched = self.executor._enrich_graph_rvk_results_with_catalog_evidence(keyword_results)
+
+        classification = enriched[0]["classifications"][0]
+        self.assertEqual(classification["catalog_hit_count"], 2)
+        self.assertEqual(classification["catalog_evidence_source"], "classification_lookup")
+
+    def test_enrich_graph_rvk_results_uses_catalog_cache_fallback_when_json_index_empty(self):
+        lookup = Mock()
+        lookup.get_rsns_for_classification.return_value = []
+        lookup.get_titles_for_classification.return_value = []
+
+        ukm = Mock()
+        ukm.get_catalog_titles_for_classification.return_value = (
+            [
+                {"rsn": 101, "title": "Titel 1", "classifications": ["RVK LK 79000"]},
+                {"rsn": 102, "title": "Titel 2", "classifications": ["RVK LK 79000"]},
+            ],
+            7,
+        )
+
+        keyword_results = [
+            {
+                "keyword": "Architektur",
+                "classifications": [
+                    {
+                        "dk": "LK 79000",
+                        "classification_type": "RVK",
+                        "source": "rvk_graph",
+                        "graph_joint_seed_count": 2,
+                    }
+                ],
+            }
+        ]
+
+        with patch("src.utils.classification_lookup_service.get_classification_lookup_service", return_value=lookup), \
+             patch("src.utils.pipeline_utils.UnifiedKnowledgeManager", return_value=ukm):
+            enriched = self.executor._enrich_graph_rvk_results_with_catalog_evidence(keyword_results)
+
+        classification = enriched[0]["classifications"][0]
+        self.assertEqual(classification["catalog_hit_count"], 7)
+        self.assertEqual(classification["catalog_evidence_source"], "catalog_cache")
+        self.assertEqual(classification["catalog_titles"], ["Titel 1", "Titel 2"])
+
+    def test_flatten_keyword_centric_results_preserves_catalog_hit_count_for_rvk(self):
+        flattened = self.executor._flatten_keyword_centric_results(
+            [
+                {
+                    "keyword": "Architektur",
+                    "classifications": [
+                        {
+                            "dk": "LK 79000",
+                            "classification_type": "RVK",
+                            "type": "RVK",
+                            "count": 2,
+                            "titles": [],
+                            "matched_keywords": ["Architektur"],
+                            "source": "rvk_graph",
+                            "catalog_hit_count": 7,
+                            "catalog_titles": ["Titel 1", "Titel 2"],
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(flattened[0]["catalog_hit_count"], 7)
+        self.assertEqual(flattened[0]["catalog_titles"], ["Titel 1", "Titel 2"])
 
 
 if __name__ == "__main__":

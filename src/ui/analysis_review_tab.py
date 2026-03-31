@@ -21,6 +21,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor, QColor
 import logging
 import os
+import html
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
@@ -201,6 +202,16 @@ class AnalysisReviewTab(QWidget):
         from .styles import get_main_stylesheet
         self.setStyleSheet(get_main_stylesheet())
 
+    @staticmethod
+    def _normalize_text_list(values: Any) -> List[str]:
+        """Normalize saved/restored string-or-list fields for display."""
+        if not values:
+            return []
+        if isinstance(values, str):
+            separators = "\n" if "\n" in values else ","
+            return [item.strip() for item in values.split(separators) if item.strip()]
+        return [str(item).strip() for item in list(values) if str(item).strip()]
+
     def _create_stat_label(self, key: str, label_text: str) -> QLabel:
         """Create a statistics label widget - Claude Generated
 
@@ -345,22 +356,38 @@ class AnalysisReviewTab(QWidget):
         dedup_layout.addWidget(self._create_stat_label("removed", "Duplicates Removed:"))
         dedup_layout.addWidget(self._create_stat_label("rate", "Deduplication Rate:"))
         dedup_layout.addWidget(self._create_stat_label("savings", "Estimated Token Savings:"))
+        dedup_layout.addWidget(self._create_stat_label("dk_breakdown", "DK Classifications:"))
+        dedup_layout.addWidget(self._create_stat_label("rvk_breakdown", "RVK Classifications:"))
         self.dk_dedup_summary.setLayout(dedup_layout)
         dk_stats_layout.addWidget(self.dk_dedup_summary)
 
         # Top 10 Table
-        top10_label = QLabel("<b>Top 10 Most Frequent Classifications</b>")
+        top10_label = QLabel("<b>Top 10 Most Frequent Classifications (Overall)</b>")
         top10_label.setFont(QFont("Segoe UI", 11))
         dk_stats_layout.addWidget(top10_label)
 
         self.dk_top10_table = QTableWidget()
         self.dk_top10_table.setColumnCount(6)
         self.dk_top10_table.setHorizontalHeaderLabels([
-            "Rank", "DK Code", "Type", "Count", "Keywords", "Confidence"
+            "Rank", "Code", "Type", "Count", "Keywords", "Confidence"
         ])
         self.dk_top10_table.horizontalHeader().setStretchLastSection(True)
         self.dk_top10_table.setMaximumHeight(300)
         dk_stats_layout.addWidget(self.dk_top10_table)
+
+        # Top RVK Table
+        rvk_top_label = QLabel("<b>Top RVK Classifications</b>")
+        rvk_top_label.setFont(QFont("Segoe UI", 11))
+        dk_stats_layout.addWidget(rvk_top_label)
+
+        self.rvk_top10_table = QTableWidget()
+        self.rvk_top10_table.setColumnCount(6)
+        self.rvk_top10_table.setHorizontalHeaderLabels([
+            "Rank", "Code", "Type", "Count", "Keywords", "Confidence"
+        ])
+        self.rvk_top10_table.horizontalHeader().setStretchLastSection(True)
+        self.rvk_top10_table.setMaximumHeight(220)
+        dk_stats_layout.addWidget(self.rvk_top10_table)
 
         # Keyword Coverage Table
         coverage_label = QLabel("<b>Keyword Coverage</b>")
@@ -430,7 +457,7 @@ class AnalysisReviewTab(QWidget):
         abstract_item.setData(0, Qt.ItemDataRole.UserRole, "original_abstract")
 
         # Initial Keywords
-        keywords_count = len(self.current_analysis.initial_keywords)
+        keywords_count = len(self._normalize_text_list(self.current_analysis.initial_keywords))
         keywords_item = QTreeWidgetItem(root)
         keywords_item.setText(0, "Initial Keywords")
         keywords_item.setText(1, f"{keywords_count} Keywords")
@@ -575,26 +602,213 @@ class AnalysisReviewTab(QWidget):
         Returns:
             Tuple of (list of titles, total count)
         """
-        if not self.current_analysis or not self.current_analysis.dk_search_results:
+        if not self.current_analysis:
             return ([], 0)
 
         expected_type, normalized_code = self._split_classification_code(dk_code)
+        if not normalized_code:
+            return ([], 0)
 
-        # Search for matching entry in dk_search_results
-        for result in self.current_analysis.dk_search_results:
+        matching_entries = self._get_classification_entries(dk_code)
+
+        if not matching_entries:
+            return ([], 0)
+
+        merged_titles: List[str] = []
+        seen_titles = set()
+        total_count = 0
+
+        for entry in matching_entries:
+            titles = [str(title).strip() for title in (entry.get("titles", []) or []) if str(title).strip()]
+            total_count += len(titles)
+            for title in titles:
+                if title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                merged_titles.append(title)
+
+        if total_count == 0:
+            total_count = max((int(entry.get("count", 0) or 0) for entry in matching_entries), default=0)
+
+        limited_titles = merged_titles[:max_titles] if len(merged_titles) > max_titles else merged_titles
+        return (limited_titles, total_count)
+
+    def _get_classification_entries(self, dk_code: str) -> List[Dict[str, Any]]:
+        """Return matching flattened or keyword-centric entries for a classification."""
+        if not self.current_analysis:
+            return []
+
+        expected_type, normalized_code = self._split_classification_code(dk_code)
+        if not normalized_code:
+            return []
+
+        matching_entries: List[Dict[str, Any]] = []
+
+        for result in self.current_analysis.dk_search_results_flattened or []:
             result_code = str(result.get("dk", "")).strip()
-            result_type = str(result.get("classification_type", "")).strip().upper()
-
+            result_type = str(
+                result.get("classification_type", result.get("type", ""))
+            ).strip().upper()
             if result_code == normalized_code and (not expected_type or result_type == expected_type):
-                titles = result.get("titles", [])
-                total_count = len(titles)
+                matching_entries.append(result)
 
-                # Limit to max_titles
-                limited_titles = titles[:max_titles] if len(titles) > max_titles else titles
+        if matching_entries:
+            return matching_entries
 
-                return (limited_titles, total_count)
+        for kw_result in self.current_analysis.dk_search_results or []:
+            for result in kw_result.get("classifications", []) or []:
+                result_code = str(result.get("dk", "")).strip()
+                result_type = str(
+                    result.get("classification_type", result.get("type", ""))
+                ).strip().upper()
+                if result_code == normalized_code and (not expected_type or result_type == expected_type):
+                    matching_entries.append(result)
 
-        return ([], 0)
+        return matching_entries
+
+    @staticmethod
+    def _escape_html(value: Any) -> str:
+        return html.escape(str(value or ""))
+
+    @staticmethod
+    def _source_label(source: str) -> str:
+        source_map = {
+            "rvk_graph": "RVK-Graph",
+            "rvk_gnd_index": "RVK-GND-Index",
+            "rvk_api": "RVK-API-Label",
+        }
+        normalized = str(source or "").strip()
+        if normalized in source_map:
+            return source_map[normalized]
+        if normalized.startswith("catalog"):
+            return "Katalog"
+        return normalized or "Unbekannt"
+
+    @staticmethod
+    def _graph_match_label(match_type: str) -> str:
+        labels = {
+            "direct_concept": "Direkttreffer",
+            "term": "Begriffstreffer",
+            "ancestor": "Elternknoten",
+            "child": "Unterklasse",
+            "sibling": "Geschwisterknoten",
+            "branch": "Zweigkontext",
+        }
+        return labels.get(str(match_type or ""), str(match_type or "Pfad"))
+
+    def _get_classification_details(self, dk_code: str) -> Dict[str, Any]:
+        entries = self._get_classification_entries(dk_code)
+        if not entries:
+            return {}
+
+        details: Dict[str, Any] = {
+            "source": "",
+            "label": "",
+            "ancestor_path": "",
+            "validation_message": "",
+            "validation_status": "",
+            "graph_parent_distance": None,
+            "graph_joint_seed_count": 0,
+            "graph_evidence": [],
+            "register": [],
+        }
+
+        seen_register: set[str] = set()
+        seen_evidence: set[tuple] = set()
+
+        for entry in entries:
+            if entry.get("source") and not details["source"]:
+                details["source"] = str(entry.get("source"))
+            if entry.get("label") and not details["label"]:
+                details["label"] = str(entry.get("label"))
+            if entry.get("ancestor_path") and not details["ancestor_path"]:
+                details["ancestor_path"] = str(entry.get("ancestor_path"))
+            if entry.get("validation_message") and not details["validation_message"]:
+                details["validation_message"] = str(entry.get("validation_message"))
+            if entry.get("rvk_validation_status") and not details["validation_status"]:
+                details["validation_status"] = str(entry.get("rvk_validation_status"))
+            if entry.get("graph_joint_seed_count") is not None:
+                details["graph_joint_seed_count"] = max(
+                    int(details.get("graph_joint_seed_count") or 0),
+                    int(entry.get("graph_joint_seed_count") or 0),
+                )
+            if entry.get("graph_parent_distance") is not None:
+                current_distance = details.get("graph_parent_distance")
+                new_distance = int(entry.get("graph_parent_distance") or 0)
+                if new_distance > 0 and (current_distance is None or new_distance < current_distance):
+                    details["graph_parent_distance"] = new_distance
+            for register_value in entry.get("register", []) or []:
+                clean = str(register_value).strip()
+                if not clean or clean in seen_register:
+                    continue
+                seen_register.add(clean)
+                details["register"].append(clean)
+            for item in entry.get("graph_evidence", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                evidence_key = (
+                    item.get("seed"),
+                    item.get("seed_type"),
+                    item.get("match_type"),
+                    tuple(item.get("path", []) or []),
+                )
+                if evidence_key in seen_evidence:
+                    continue
+                seen_evidence.add(evidence_key)
+                details["graph_evidence"].append(item)
+
+        details["graph_evidence"].sort(
+            key=lambda item: float(item.get("weight", 0) or 0),
+            reverse=True,
+        )
+        return details
+
+    def _build_graph_rationale_text(self, details: Dict[str, Any]) -> str:
+        graph_evidence = list(details.get("graph_evidence", []) or [])
+        if not graph_evidence:
+            return ""
+
+        seeds: List[str] = []
+        seen_seeds = set()
+        for item in graph_evidence:
+            seed = str(item.get("seed", "")).strip()
+            if not seed or seed in seen_seeds:
+                continue
+            seen_seeds.add(seed)
+            seeds.append(seed)
+            if len(seeds) >= 2:
+                break
+        seed_text = ", ".join(seeds) if seeds else "den thematischen Ankern"
+
+        match_types = {str(item.get("match_type", "")).strip() for item in graph_evidence}
+        parts: List[str] = []
+        if {"direct_concept", "term"} & match_types:
+            parts.append(f"direkte thematische Treffer für {seed_text}")
+        if "ancestor" in match_types:
+            parts.append("Stützung über Elternknoten")
+        if "child" in match_types:
+            parts.append("Erweiterung über spezifischere Unterklassen")
+        if "sibling" in match_types:
+            parts.append("Ergänzung über Geschwisterknoten im selben Zweig")
+        if "branch" in match_types:
+            parts.append("Passung über Zweigkontext")
+
+        if not parts:
+            return ""
+        return "RVK-Graph: " + "; ".join(parts)
+
+    def _build_graph_evidence_lines(self, details: Dict[str, Any], max_items: int = 3) -> List[str]:
+        lines: List[str] = []
+        for item in list(details.get("graph_evidence", []) or [])[:max_items]:
+            path = [str(part).strip() for part in (item.get("path", []) or []) if str(part).strip()]
+            path_text = " &rarr; ".join(self._escape_html(part) for part in path) if path else ""
+            label = self._graph_match_label(str(item.get("match_type", "")))
+            if path_text:
+                lines.append(f"{path_text} <span style='color: #666;'>({self._escape_html(label)})</span>")
+            else:
+                seed = self._escape_html(item.get("seed"))
+                lines.append(f"{seed} <span style='color: #666;'>({self._escape_html(label)})</span>")
+        return lines
 
     def populate_detail_tabs(self):
         """Populate the detail tabs with data - Claude Generated (Refactored)"""
@@ -605,7 +819,8 @@ class AnalysisReviewTab(QWidget):
         self.abstract_text.setPlainText(self.current_analysis.original_abstract or "")
 
         # Initial Keywords
-        self.initial_keywords_text.setPlainText("\n".join(self.current_analysis.initial_keywords))
+        initial_keywords = self._normalize_text_list(self.current_analysis.initial_keywords)
+        self.initial_keywords_text.setPlainText("\n".join(initial_keywords))
 
         # Search Results
         self.populate_search_results_table()
@@ -613,7 +828,9 @@ class AnalysisReviewTab(QWidget):
         # GND Compliant Keywords (from final_llm_analysis)
         gnd_keywords_list = []
         if self.current_analysis.final_llm_analysis:
-            gnd_keywords_list = self.current_analysis.final_llm_analysis.extracted_gnd_keywords
+            gnd_keywords_list = self._normalize_text_list(
+                self.current_analysis.final_llm_analysis.extracted_gnd_keywords
+            )
         self.gnd_keywords_text.setPlainText("\n".join(gnd_keywords_list))
 
         # Final Analysis
@@ -659,6 +876,8 @@ class AnalysisReviewTab(QWidget):
             for idx, dk_code in enumerate(self.current_analysis.classifications, 1):
                 # Get titles for this classification
                 titles, total_count = self._get_titles_for_classification(dk_code)
+                details = self._get_classification_details(dk_code)
+                system, _ = self._split_classification_code(dk_code)
 
                 # Determine color based on frequency (confidence level) - Claude Generated
                 color, bg_color, _, _ = get_confidence_style(total_count)
@@ -684,6 +903,36 @@ class AnalysisReviewTab(QWidget):
                         f"📚 Katalogisiert in {total_count} Titel{'n' if total_count != 1 else ''}</p>"
                     )
                 html_parts.append("</div>")
+
+                meta_bits = []
+                if details.get("source"):
+                    meta_bits.append(f"Quelle: {self._escape_html(self._source_label(details['source']))}")
+                if details.get("label") and system == "RVK":
+                    meta_bits.append(self._escape_html(details["label"]))
+                if details.get("ancestor_path") and system == "RVK":
+                    meta_bits.append(f"Zweig: {self._escape_html(details['ancestor_path'])}")
+                if meta_bits:
+                    html_parts.append(
+                        "<div style='padding-left: 20px; margin: 0 0 8px 0; font-size: 9pt; color: #555;'>"
+                        + " · ".join(meta_bits)
+                        + "</div>"
+                    )
+
+                rationale = self._build_graph_rationale_text(details)
+                if rationale:
+                    html_parts.append(
+                        "<div style='padding-left: 20px; margin: 0 0 8px 0;'>"
+                        f"<p style='font-size: 9pt; color: #2a5c7a; margin: 0;'><b>Graph-Rationale:</b> {self._escape_html(rationale)}</p>"
+                        "</div>"
+                    )
+
+                evidence_lines = self._build_graph_evidence_lines(details)
+                if evidence_lines:
+                    html_parts.append("<div style='padding-left: 20px; margin: 0 0 12px 0;'>")
+                    html_parts.append("<ul style='font-size: 9pt; color: #444; margin: 0; padding-left: 18px;'>")
+                    for line in evidence_lines:
+                        html_parts.append(f"<li>{line}</li>")
+                    html_parts.append("</ul></div>")
 
                 # Titles list
                 if titles:
@@ -852,7 +1101,7 @@ class AnalysisReviewTab(QWidget):
         abstract_len = len(self.current_analysis.original_abstract or "")
         stats_text += f"Original Abstract: {abstract_len} Zeichen\n"
 
-        initial_keywords_count = len(self.current_analysis.initial_keywords or [])
+        initial_keywords_count = len(self._normalize_text_list(self.current_analysis.initial_keywords))
         stats_text += f"Initial Keywords: {initial_keywords_count} Keywords\n"
 
         search_results = self.current_analysis.search_results or []
@@ -912,6 +1161,7 @@ class AnalysisReviewTab(QWidget):
             for label in self.dk_dedup_labels.values():
                 label.setText("<i>No statistics available</i>")
             self.dk_top10_table.setRowCount(0)
+            self.rvk_top10_table.setRowCount(0)
             self.dk_coverage_table.setRowCount(0)
             return
 
@@ -936,6 +1186,17 @@ class AnalysisReviewTab(QWidget):
             self.dk_dedup_labels["savings"].setText(
                 f"Estimated Token Savings: <b>~{dedup.get('estimated_token_savings', 0)} tokens</b>"
             )
+        type_breakdown = stats.get("type_breakdown", {})
+        dk_breakdown = type_breakdown.get("DK", {})
+        rvk_breakdown = type_breakdown.get("RVK", {})
+        self.dk_dedup_labels["dk_breakdown"].setText(
+            f"DK Classifications: <b>{dk_breakdown.get('classifications', 0)}</b> "
+            f"({dk_breakdown.get('occurrences', 0)} Treffer)"
+        )
+        self.dk_dedup_labels["rvk_breakdown"].setText(
+            f"RVK Classifications: <b>{rvk_breakdown.get('classifications', 0)}</b> "
+            f"({rvk_breakdown.get('occurrences', 0)} Treffer)"
+        )
 
         # Populate Top 10 Table
         most_frequent = stats.get("most_frequent", [])
@@ -976,6 +1237,40 @@ class AnalysisReviewTab(QWidget):
             self.dk_top10_table.setItem(row, 5, conf_item)
 
         self.dk_top10_table.resizeColumnsToContents()
+
+        # Populate Top RVK Table
+        most_frequent_rvk = stats.get("most_frequent_rvk", [])
+        self.rvk_top10_table.setRowCount(len(most_frequent_rvk))
+
+        for row, item in enumerate(most_frequent_rvk):
+            rank_item = QTableWidgetItem(str(row + 1))
+            rank_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.rvk_top10_table.setItem(row, 0, rank_item)
+
+            self.rvk_top10_table.setItem(row, 1, QTableWidgetItem(item.get('dk', 'unknown')))
+
+            type_item = QTableWidgetItem(item.get('type', 'RVK'))
+            type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.rvk_top10_table.setItem(row, 2, type_item)
+
+            count_item = QTableWidgetItem(str(item.get('count', 0)))
+            count_item.setTextAlignment(Qt.AlignmentFlag.AlignRight)
+            self.rvk_top10_table.setItem(row, 3, count_item)
+
+            keywords = item.get('keywords', [])
+            kw_display = ', '.join(keywords[:3])
+            if len(keywords) > 3:
+                kw_display += f' (+{len(keywords)-3} more)'
+            self.rvk_top10_table.setItem(row, 4, QTableWidgetItem(kw_display))
+
+            unique_titles = item.get('unique_titles', item.get('count', 0))
+            text_color, bg_color, label, bar = get_confidence_style(unique_titles)
+
+            conf_item = QTableWidgetItem(f"{bar} {label}")
+            conf_item.setBackground(QColor(bg_color))
+            self.rvk_top10_table.setItem(row, 5, conf_item)
+
+        self.rvk_top10_table.resizeColumnsToContents()
 
         # Populate Keyword Coverage
         coverage = stats.get("keyword_coverage", {})

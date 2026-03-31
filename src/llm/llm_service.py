@@ -1492,8 +1492,9 @@ class LlmService(QObject):
 
             # Handle streaming option
             if stream:
-                response_stream = self.clients[provider].chat.completions.create(
-                    **params
+                response_stream = self._create_openai_compatible_completion(
+                    provider=provider,
+                    params=params,
                 )
 
                 # Speichere request_id für möglichen Abbruch
@@ -1554,7 +1555,10 @@ class LlmService(QObject):
                 return stream_generator()
             else:
                 # Make API call without streaming
-                response = self.clients[provider].chat.completions.create(**params)
+                response = self._create_openai_compatible_completion(
+                    provider=provider,
+                    params=params,
+                )
                 return response.choices[0].message.content
 
         except Exception as e:
@@ -1562,6 +1566,51 @@ class LlmService(QObject):
             error_msg = f"Error with {provider.capitalize()}: {str(e)}"
             self.generation_error.emit(self.current_request_id, error_msg)
             return error_msg
+
+    def _create_openai_compatible_completion(
+        self,
+        provider: str,
+        params: Dict[str, Any],
+    ) -> Any:
+        """Create an OpenAI-compatible completion with compatibility retry for strict models."""
+        try:
+            return self.clients[provider].chat.completions.create(**params)
+        except Exception as exc:
+            if not self._should_retry_openai_without_sampling(exc, params):
+                raise
+
+            retry_params = dict(params)
+            removed_controls = []
+            for control_name in ("temperature", "top_p"):
+                if control_name in retry_params:
+                    retry_params.pop(control_name, None)
+                    removed_controls.append(control_name)
+
+            self.logger.warning(
+                "Retrying OpenAI-compatible request for %s/%s without %s after provider rejected custom sampling controls",
+                provider,
+                retry_params.get("model"),
+                ", ".join(removed_controls),
+            )
+            return self.clients[provider].chat.completions.create(**retry_params)
+
+    @staticmethod
+    def _should_retry_openai_without_sampling(exc: Exception, params: Dict[str, Any]) -> bool:
+        """Return True when an OpenAI-compatible request should be retried without sampling controls."""
+        if "temperature" not in params and "top_p" not in params:
+            return False
+
+        error_text = str(exc).lower()
+        if "unsupported value" not in error_text and "unsupported_value" not in error_text:
+            return False
+
+        sampling_markers = (
+            "temperature",
+            "top_p",
+            "sampling",
+            "default (1)",
+        )
+        return any(marker in error_text for marker in sampling_markers)
 
     def _generate_ollama(
         self,

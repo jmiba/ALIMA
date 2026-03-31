@@ -249,6 +249,71 @@ class UnifiedKnowledgeManager:
             rows = self.db_manager.fetch_all(query)
             columns = dialect.parse_table_info(db_type, rows if rows else [])
 
+            # Step 0: Ensure found_titles column exists.
+            # Older broken migrations produced catalog_dk_cache without this column,
+            # which makes catalog evidence persistence impossible.
+            if "found_titles" not in columns:
+                self.logger.info("🔄 Migrating catalog_dk_cache: adding missing found_titles column...")
+                try:
+                    self.db_manager.execute_query(
+                        dialect.alter_table_add_column(
+                            db_type,
+                            'catalog_dk_cache',
+                            'found_titles',
+                            dialect.text_type(db_type),
+                        )
+                    )
+                    self.logger.info("✅ catalog_dk_cache migration completed: added found_titles column")
+                    rows = self.db_manager.fetch_all(query)
+                    columns = dialect.parse_table_info(db_type, rows if rows else [])
+                except Exception as e:
+                    self.logger.warning(f"Failed to add found_titles via ALTER TABLE ({e}), attempting table rebuild...")
+                    try:
+                        self.db_manager.execute_query(f"""
+                            CREATE TABLE catalog_dk_cache_new (
+                                search_term {dialect.varchar_type(512)} PRIMARY KEY,
+                                normalized_term {dialect.varchar_type(512)} NOT NULL,
+                                found_titles {dialect.text_type(db_type)},
+                                result_count INTEGER DEFAULT 0,
+                                last_updated {dialect.timestamp_type(db_type)} DEFAULT CURRENT_TIMESTAMP,
+                                created_at {dialect.timestamp_type(db_type)} DEFAULT CURRENT_TIMESTAMP,
+                                search_status {dialect.varchar_type(32)} DEFAULT 'success',
+                                error_message {dialect.text_type(db_type)},
+                                retry_after {dialect.timestamp_type(db_type)},
+                                consecutive_failures INTEGER DEFAULT 0
+                            )
+                        """)
+
+                        source_columns = [col for col in [
+                            "search_term",
+                            "normalized_term",
+                            "result_count",
+                            "last_updated",
+                            "created_at",
+                            "search_status",
+                            "error_message",
+                            "retry_after",
+                            "consecutive_failures",
+                        ] if col in columns]
+                        if source_columns:
+                            self.db_manager.execute_query(f"""
+                                INSERT INTO catalog_dk_cache_new
+                                (search_term, normalized_term, result_count, last_updated, created_at,
+                                 search_status, error_message, retry_after, consecutive_failures)
+                                SELECT {', '.join(source_columns)}
+                                FROM catalog_dk_cache
+                            """)
+
+                        self.db_manager.execute_query("DROP TABLE catalog_dk_cache")
+                        self.db_manager.execute_query("ALTER TABLE catalog_dk_cache_new RENAME TO catalog_dk_cache")
+                        self.db_manager.execute_query("CREATE INDEX IF NOT EXISTS idx_catalog_normalized ON catalog_dk_cache(normalized_term)")
+                        self.db_manager.execute_query("CREATE INDEX IF NOT EXISTS idx_catalog_updated ON catalog_dk_cache(last_updated)")
+                        self.logger.info("✅ catalog_dk_cache migration completed via table rebuild: restored found_titles column")
+                        rows = self.db_manager.fetch_all(query)
+                        columns = dialect.parse_table_info(db_type, rows if rows else [])
+                    except Exception as rebuild_error:
+                        self.logger.error(f"Migration table rebuild failed while restoring found_titles: {rebuild_error}")
+
             # Step 1: Remove old found_classifications column if exists
             if "found_classifications" in columns:
                 self.logger.info("🔄 Migrating catalog_dk_cache: removing unused found_classifications column...")
@@ -973,6 +1038,87 @@ class UnifiedKnowledgeManager:
         except Exception as e:
             self.logger.error(f"Error retrieving catalog cache for '{search_term}': {e}")
             return None
+
+    def get_catalog_titles_for_classification(
+        self,
+        classification: str,
+        max_titles: int = 20,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Return cached catalog titles/count for a DK/RVK classification from local catalog cache.
+
+        This is a best-effort local fallback when no prebuilt classification->RSN JSON index
+        is available. It scans cached catalog title records and counts unique matching titles.
+        """
+        try:
+            requested = str(classification or "").strip()
+            if not requested:
+                return ([], 0)
+
+            requested_upper = requested.upper()
+            classification_variants = {requested_upper}
+            if requested_upper.startswith("RVK "):
+                classification_variants.add(requested_upper[4:].strip())
+            elif requested_upper.startswith("DK "):
+                classification_variants.add(requested_upper[3:].strip())
+            elif re.match(r"^[A-Z]", requested_upper):
+                classification_variants.add(f"RVK {requested_upper}")
+            else:
+                classification_variants.add(f"DK {requested_upper}")
+
+            rows = self.db_manager.fetch_all(
+                """
+                SELECT found_titles
+                FROM catalog_dk_cache
+                WHERE search_status = 'success'
+                  AND found_titles IS NOT NULL
+                  AND found_titles != ''
+                """
+            )
+
+            matched_titles: List[Dict[str, Any]] = []
+            matched_count = 0
+            seen_items = set()
+
+            for row in rows or []:
+                try:
+                    title_entries = json.loads(row.get("found_titles") or "[]")
+                except Exception:
+                    continue
+
+                if not isinstance(title_entries, list):
+                    continue
+
+                for entry in title_entries:
+                    if not isinstance(entry, dict):
+                        continue
+
+                    raw_classifications = entry.get("classifications", []) or []
+                    normalized_classifications = {
+                        str(item or "").strip().upper()
+                        for item in raw_classifications
+                        if str(item or "").strip()
+                    }
+                    if not (normalized_classifications & classification_variants):
+                        continue
+
+                    title_key = (
+                        str(entry.get("rsn") or "").strip()
+                        or str(entry.get("title") or "").strip()
+                    )
+                    if not title_key or title_key in seen_items:
+                        continue
+
+                    seen_items.add(title_key)
+                    matched_count += 1
+
+                    if len(matched_titles) < max_titles:
+                        matched_titles.append(entry)
+
+            return (matched_titles, matched_count)
+
+        except Exception as e:
+            self.logger.error(f"Error retrieving cached catalog titles for classification '{classification}': {e}")
+            return ([], 0)
 
     def store_catalog_dk_cache(self, search_term: str, titles: List[Dict[str, Any]],
                              status: str = 'success', error_message: Optional[str] = None,

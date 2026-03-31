@@ -441,6 +441,10 @@ class UnifiedProviderConfig:
     # Claude Generated - Provider Strategy Simplification
     pipeline_default_provider: str = ""  # e.g. "ollama", "gemini"
     pipeline_default_model: str = ""     # e.g. "cogito:32b", "gemini-1.5-flash"
+    pipeline_auto_advance: bool = True
+    pipeline_stop_on_error: bool = True
+    pipeline_search_suggesters: List[str] = field(default_factory=lambda: ["lobid", "swb"])
+    pipeline_step_defaults: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # Task-specific preferences (for step overrides)
     task_preferences: Dict[str, TaskPreference] = field(default_factory=dict)

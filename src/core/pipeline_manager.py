@@ -216,6 +216,7 @@ class PipelineConfig:
                         "catalog_token": "",
                         "catalog_search_url": None,
                         "catalog_details_url": None,
+                        "use_rvk_graph_retrieval": False,
                     }
                 ),
                 "dk_classification": PipelineStepConfig(
@@ -250,12 +251,41 @@ class PipelineConfig:
                         step_configs[step_id].think = think_val
                         logger.debug(f"Think override for {step_id}: think={think_val}")
 
+            # Apply persisted pipeline step defaults from the pipeline configuration dialog
+            for step_id, step_defaults in (unified_config.pipeline_step_defaults or {}).items():
+                if step_id not in step_configs or not isinstance(step_defaults, dict):
+                    continue
+
+                step_config = step_configs[step_id]
+                for attr in [
+                    "enabled",
+                    "provider",
+                    "model",
+                    "task",
+                    "temperature",
+                    "top_p",
+                    "max_tokens",
+                    "seed",
+                    "repetition_penalty",
+                    "think",
+                    "enable_iterative_refinement",
+                    "max_refinement_iterations",
+                ]:
+                    if attr in step_defaults:
+                        setattr(step_config, attr, step_defaults[attr])
+
+                custom_params = step_defaults.get("custom_params")
+                if isinstance(custom_params, dict):
+                    step_config.custom_params.update(custom_params)
+
+                logger.debug(f"Applied persisted pipeline defaults for step '{step_id}'")
+
             return cls(
-                auto_advance=True,
-                stop_on_error=True,
+                auto_advance=unified_config.pipeline_auto_advance,
+                stop_on_error=unified_config.pipeline_stop_on_error,
                 save_intermediate_results=True,
                 step_configs=step_configs,
-                search_suggesters=["lobid", "swb"]
+                search_suggesters=unified_config.pipeline_search_suggesters or ["lobid", "swb"]
             )
 
         except Exception as e:
@@ -1366,6 +1396,9 @@ class PipelineManager:
                 catalog_web_record_url=catalog_web_record_url,
                 force_update=getattr(self, 'force_update', False),  # Claude Generated
                 strict_gnd_validation=strict_gnd_validation,  # EXPERT OPTION - Claude Generated
+                use_rvk_graph_retrieval=bool(step_config.custom_params.get("use_rvk_graph_retrieval", False)),
+                original_abstract=self.current_analysis_state.original_abstract if self.current_analysis_state else "",
+                llm_analysis=self.current_analysis_state.final_llm_analysis if self.current_analysis_state else None,
             )
 
             # Extract components from new deduplication-aware format - Claude Generated Step 5
@@ -1465,6 +1498,12 @@ class PipelineManager:
                 "rvk_anchor_keywords": rvk_anchor_keywords,
                 "repetition_penalty": step_config.repetition_penalty,
                 "think": step_config.think,
+                "use_rvk_graph_retrieval": bool(
+                    getattr(self.config.get_step_config("dk_search"), "custom_params", {}).get(
+                        "use_rvk_graph_retrieval",
+                        False,
+                    )
+                ),
             }
 
             # Add repetition callback if available

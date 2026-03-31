@@ -979,6 +979,11 @@ async def run_analysis(
         services = app_context.get_services()
 
         config_manager = services['config_manager']
+        try:
+            config_manager.load_config(force_reload=True)
+            logger.info("Reloaded config from disk for web analysis session")
+        except Exception as cfg_exc:
+            logger.warning(f"Could not force-reload config for web analysis session: {cfg_exc}")
 
         # Create a NEW PipelineManager for this session to prevent cross-session contamination - Claude Generated (2026-01-13)
         # This ensures each concurrent analysis has its own isolated pipeline state
@@ -1057,11 +1062,17 @@ async def run_analysis(
             # Sync analysis state reference so autosave has access - Claude Generated
             session.current_analysis_state = analysis_state
 
-            # Use shared extraction helper (DRY principle) - Claude Generated
-            session.results = _prepare_results_for_export(
-                _extract_results_from_analysis_state(analysis_state),
-                validate_rvk=True,
-            )
+            try:
+                # Use shared extraction helper (DRY principle) - Claude Generated
+                session.results = _prepare_results_for_export(
+                    _extract_results_from_analysis_state(analysis_state),
+                    validate_rvk=True,
+                )
+            except Exception as exc:
+                logger.error(f"Result serialization failed after pipeline completion: {exc}", exc_info=True)
+                session.status = "error"
+                session.error_message = f"Result serialization failed: {exc}"
+                return
 
             # Synchronize session.working_title with session.results['working_title'] - Claude Generated
             if session.results.get('working_title'):

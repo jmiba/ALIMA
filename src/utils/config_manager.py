@@ -397,6 +397,10 @@ class ConfigManager:
         # Parse pipeline default provider/model - Claude Generated
         unified_config.pipeline_default_provider = data.get("pipeline_default_provider", "")
         unified_config.pipeline_default_model = data.get("pipeline_default_model", "")
+        unified_config.pipeline_auto_advance = data.get("pipeline_auto_advance", True)
+        unified_config.pipeline_stop_on_error = data.get("pipeline_stop_on_error", True)
+        unified_config.pipeline_search_suggesters = data.get("pipeline_search_suggesters", ["lobid", "swb"])
+        unified_config.pipeline_step_defaults = data.get("pipeline_step_defaults", {})
 
         # Parse individual provider configs (legacy support)
         unified_config.gemini_api_key = data.get("gemini_api_key", "")
@@ -559,21 +563,37 @@ class ConfigManager:
                         self.logger.critical(f"🔍 SAVE_CONFIG_DISK_PROVIDERS: Found {len(preserved_providers)} providers on disk")
 
                         # CRITICAL FIX: Use INCOMING providers from input config, not preserved from disk - Claude Generated
-                        incoming_providers = config_dict.get('unified_config', {}).get('providers', [])
+                        incoming_unified_config = config_dict.get('unified_config', {})
+                        incoming_providers = incoming_unified_config.get('providers', [])
                         self.logger.critical(f"🔍 SAVE_CONFIG_INPUT_PROVIDERS: Found {len(incoming_providers)} providers in input config")
                         for i, p in enumerate(incoming_providers):
                             self.logger.critical(f"🔍 SAVE_CONFIG_INPUT_PROVIDER_{i}: {p.get('name', 'NO_NAME')} ({p.get('provider_type', 'NO_TYPE')})")
 
-                        incoming_task_prefs = config_dict.get('unified_config', {}).get('task_preferences', {})
+                        incoming_task_prefs = incoming_unified_config.get('task_preferences', {})
                         preserved_unified_config = current_config['unified_config'].copy()
 
-                        # Update with NEW providers and task preferences from input config - Claude Generated
-                        preserved_unified_config['providers'] = incoming_providers  # ✅ USE NEW PROVIDERS FROM INPUT
+                        # Merge all incoming unified settings while still protecting against accidental
+                        # provider/task-preference loss from partial callers.
+                        for key, value in incoming_unified_config.items():
+                            if key in {'providers', 'task_preferences'}:
+                                continue
+                            preserved_unified_config[key] = value
+
+                        if incoming_providers:
+                            preserved_unified_config['providers'] = incoming_providers
+                        else:
+                            self.logger.critical("🔍 SAVE_CONFIG_PROVIDERS_PRESERVED: incoming providers empty, keeping disk providers")
+
                         if incoming_task_prefs:
                             preserved_unified_config['task_preferences'] = incoming_task_prefs
-                            self.logger.critical(f"✅ Updated unified_config: {len(incoming_providers)} providers (from input), {len(incoming_task_prefs)} task prefs")
-                        else:
-                            self.logger.critical(f"✅ Updated unified_config: {len(incoming_providers)} providers (from input), no task prefs")
+                        elif 'task_preferences' in incoming_unified_config:
+                            preserved_unified_config['task_preferences'] = incoming_task_prefs
+
+                        self.logger.critical(
+                            f"✅ Updated unified_config: {len(preserved_unified_config.get('providers', []))} providers, "
+                            f"{len(preserved_unified_config.get('task_preferences', {}))} task prefs, "
+                            f"pipeline defaults keys={[k for k in incoming_unified_config.keys() if k not in {'providers', 'task_preferences'}]}"
+                        )
 
                         config_dict['unified_config'] = preserved_unified_config
                     else:

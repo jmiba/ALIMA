@@ -257,7 +257,7 @@ class RvkMarcIndex:
 
                     if progress_callback and records_processed % 20000 == 0:
                         progress_callback(
-                            f"  ↳ RVK MarcXML-Index: {records_processed} Datensaetze verarbeitet\n"
+                            f"  ↳ RVK MarcXML-Index: {records_processed} Datensätze verarbeitet\n"
                         )
 
                     elem.clear()

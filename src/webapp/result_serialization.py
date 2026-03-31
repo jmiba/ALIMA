@@ -59,10 +59,19 @@ def parse_classification_entry(item: Any) -> Dict[str, Any]:
     extras: Dict[str, Any] = {}
 
     if isinstance(item, dict):
-        extras = {k: v for k, v in item.items() if k not in {"system", "code", "display"}}
+        extras = {
+            k: v
+            for k, v in item.items()
+            if k not in {"system", "code", "display", "dk", "type", "classification_type"}
+        }
         display = str(item.get("display") or "").strip()
-        system = str(item.get("system") or "").strip().upper()
-        code = str(item.get("code") or "").strip()
+        system = str(
+            item.get("system")
+            or item.get("classification_type")
+            or item.get("type")
+            or ""
+        ).strip().upper()
+        code = str(item.get("code") or item.get("dk") or "").strip()
     else:
         display = str(item or "").strip()
         system = ""
@@ -209,6 +218,7 @@ def prepare_results_for_export(
     prepared["rvk_provenance"] = {
         "catalog_standard": int(rvk_provenance.get("catalog_standard", 0) or 0),
         "catalog_nonstandard": int(rvk_provenance.get("catalog_nonstandard", 0) or 0),
+        "rvk_graph": int(rvk_provenance.get("rvk_graph", 0) or 0),
         "rvk_gnd_index": int(rvk_provenance.get("rvk_gnd_index", 0) or 0),
         "rvk_api": int(rvk_provenance.get("rvk_api", 0) or 0),
     }

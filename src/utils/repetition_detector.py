@@ -200,19 +200,26 @@ class RepetitionDetector:
         """
         # Tokenize new chunk into words
         words = re.findall(r'\b\w+\b', new_chunk.lower())
+        previous_len = len(self._word_buffer)
         self._word_buffer.extend(words)
 
         # Keep word buffer manageable (last 1000 words)
         if len(self._word_buffer) > 1000:
+            overflow = len(self._word_buffer) - 1000
             self._word_buffer = self._word_buffer[-1000:]
+            previous_len = max(0, previous_len - overflow)
 
         # Build N-grams from buffer
         n = self.config.ngram_size
         if len(self._word_buffer) < n:
             return None
 
-        # Count new N-grams
-        for i in range(len(self._word_buffer) - n + 1):
+        # Count only N-grams that become newly available because of the appended words.
+        # Recounting the entire rolling buffer on every chunk artificially inflates
+        # counts and causes false-positive repetition loops.
+        start_idx = max(0, previous_len - n + 1)
+        end_idx = len(self._word_buffer) - n + 1
+        for i in range(start_idx, end_idx):
             ngram = tuple(self._word_buffer[i:i + n])
             self._ngram_counter[ngram] += 1
 

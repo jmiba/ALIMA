@@ -779,10 +779,10 @@ class UnifiedInputWidget(QWidget):
             QFrame:hover {
                 border-color: #1976d2;
                 background-color: #bbdefb;
-                cursor: pointer;
             }
         """
         )
+        self.webcam_frame.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # Make frame clickable
         self.webcam_frame.mousePressEvent = lambda event: self.capture_from_webcam()

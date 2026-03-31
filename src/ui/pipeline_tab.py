@@ -1264,7 +1264,11 @@ class PipelineTab(QWidget):
         html_parts.append("<html><body style='font-family: Arial, sans-serif;'>")
 
         for idx, dk_code in enumerate(dk_classifications, 1):
-            titles, total_count = self._get_titles_for_dk_code(dk_code, dk_search_results)
+            classification_meta = self._get_titles_for_dk_code(dk_code, dk_search_results)
+            titles = classification_meta["titles"]
+            total_count = classification_meta["count"]
+            count_label = classification_meta["count_label"]
+            count_description = classification_meta["count_description"]
 
             # Color-coding based on frequency (confidence)
             if total_count > 50:
@@ -1285,9 +1289,9 @@ class PipelineTab(QWidget):
                 confidence_bar = "🟩" * min(5, (total_count // 10) + 1)
                 html_parts.append(
                     f"<p style='color: {color}; font-weight: bold; margin: 5px 0 2px 0;'>"
-                    f"{confidence_bar} {total_count} Katalog-Treffer</p>"
+                    f"{confidence_bar} {count_label}</p>"
                     f"<p style='color: {color}; font-size: 9pt; opacity: 0.8; margin: 0 0 10px 0;'>"
-                    f"📚 Diese Klassifikation wurde in {total_count} Titel{'n' if total_count != 1 else ''} gefunden.</p>"
+                    f"📚 {count_description}</p>"
                 )
             html_parts.append("</div>")
 
@@ -1321,10 +1325,15 @@ class PipelineTab(QWidget):
         self,
         dk_code: str,
         dk_search_results: List[Dict[str, Any]]
-    ) -> tuple[list, int]:
+    ) -> Dict[str, Any]:
         """Extract titles for a specific classification code - Claude Generated"""
         if not dk_search_results:
-            return ([], 0)
+            return {
+                "titles": [],
+                "count": 0,
+                "count_label": "0 Katalog-Treffer",
+                "count_description": "Keine Katalogabdeckung gefunden.",
+            }
 
         expected_type, normalized_code = self._split_classification_code(dk_code)
 
@@ -1332,10 +1341,81 @@ class PipelineTab(QWidget):
             result_code = str(result.get("dk", "")).strip()
             result_type = str(result.get("classification_type", "")).strip().upper()
             if result_code == normalized_code and (not expected_type or result_type == expected_type):
-                titles = result.get("titles", [])
-                return (titles[:50], len(titles))  # Max 50 for display
+                titles = [str(title).strip() for title in (result.get("titles", []) or []) if str(title).strip()]
+                catalog_titles = [str(title).strip() for title in (result.get("catalog_titles", []) or []) if str(title).strip()]
+                total_count = len(titles)
+                count_label = f"{total_count} Katalog-Treffer"
+                count_description = f"Diese Klassifikation wurde in {total_count} Titel{'n' if total_count != 1 else ''} gefunden."
 
-        return ([], 0)
+                if expected_type == "RVK":
+                    catalog_hit_count = int(result.get("catalog_hit_count", 0) or 0)
+                    if catalog_hit_count > total_count:
+                        total_count = catalog_hit_count
+                        count_label = f"{total_count} Katalog-Treffer"
+                        evidence_source = str(result.get("catalog_evidence_source", "") or "")
+                        if evidence_source == "catalog_cache":
+                            count_description = (
+                                f"Diese graph-basierte RVK wurde im lokalen Katalog-Cache mit "
+                                f"{total_count} Katalog-Treffern belegt."
+                            )
+                        else:
+                            count_description = (
+                                f"Diese graph-basierte RVK wurde im Klassifikationsindex mit "
+                                f"{total_count} Katalog-Treffern belegt."
+                            )
+                    if not titles and catalog_titles:
+                        titles = catalog_titles
+
+                return {
+                    "titles": titles[:50],
+                    "count": total_count,
+                    "count_label": count_label,
+                    "count_description": count_description,
+                }
+
+        if expected_type == "RVK":
+            fallback = self._get_cached_catalog_titles_for_classification(f"RVK {normalized_code}")
+            if fallback["count"] > 0:
+                return fallback
+
+        return {
+            "titles": [],
+            "count": 0,
+            "count_label": "0 Katalog-Treffer",
+            "count_description": "Keine Katalogabdeckung gefunden.",
+        }
+
+    def _get_cached_catalog_titles_for_classification(self, classification: str) -> Dict[str, Any]:
+        """Best-effort fallback for final RVK cards using local catalog cache."""
+        try:
+            from ..core.unified_knowledge_manager import UnifiedKnowledgeManager
+
+            ukm = UnifiedKnowledgeManager()
+            title_entries, total_count = ukm.get_catalog_titles_for_classification(classification, max_titles=50)
+            titles = [
+                str(entry.get("title", "") or "").strip()
+                for entry in title_entries or []
+                if isinstance(entry, dict) and str(entry.get("title", "") or "").strip()
+            ]
+            if total_count > 0:
+                return {
+                    "titles": titles[:50],
+                    "count": int(total_count),
+                    "count_label": f"{int(total_count)} Katalog-Treffer",
+                    "count_description": (
+                        f"Diese RVK wurde im lokalen Katalog-Cache mit {int(total_count)} "
+                        f"Katalog-Treffern belegt."
+                    ),
+                }
+        except Exception:
+            pass
+
+        return {
+            "titles": [],
+            "count": 0,
+            "count_label": "0 Katalog-Treffer",
+            "count_description": "Keine Katalogabdeckung gefunden.",
+        }
 
     def start_auto_pipeline(self):
         """Start the automatic pipeline in background thread - Claude Generated"""
